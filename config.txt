@@ -1,0 +1,1 @@
+smtp.gmail.com;587;rpetr660@gmail.com;zone qnkl adzi czjp;rpetr660@gmail.com
