@@ -116,6 +116,77 @@ static std::string toHex(const std::vector<uint8_t>& data) {
 }
 
 // ============================================================
+// Вывод таблиц с автоматической шириной колонок
+// ============================================================
+// Обычный std::setw считает ширину по количеству БАЙТ в std::string,
+// а не по количеству отображаемых символов — для строк с кириллицей
+// в UTF-8 (2 байта на символ) это даёт неверное выравнивание. Поэтому
+// здесь считаем видимую ширину строки вручную (по числу UTF-8
+// кодовых точек), а не полагаемся на setw.
+static size_t utf8DisplayWidth(const std::string& s) {
+    size_t width = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if ((c & 0x80) == 0) i += 1;        // ASCII, 1 байт
+        else if ((c & 0xE0) == 0xC0) i += 2; // 2-байтовая последовательность (напр. кириллица)
+        else if ((c & 0xF0) == 0xE0) i += 3; // 3-байтовая
+        else if ((c & 0xF8) == 0xF0) i += 4; // 4-байтовая
+        else i += 1;                          // некорректный байт — пропускаем как есть
+        width++;
+    }
+    return width;
+}
+
+static std::string padToWidth(const std::string& s, size_t width) {
+    size_t w = utf8DisplayWidth(s);
+    if (w >= width) return s;
+    return s + std::string(width - w, ' ');
+}
+
+// Печатает таблицу с колонками, ширина каждой из которых равна
+// максимальной видимой ширине среди заголовка и всех значений этой
+// колонки (плюс отступ между колонками) — подходит для вывода
+// произвольного размера, а не только для конкретного списка полей.
+static void printAlignedTable(const std::vector<std::string>& headers,
+                               const std::vector<std::vector<std::string>>& rows) {
+    size_t colCount = headers.size();
+    std::vector<size_t> colWidth(colCount);
+    for (size_t c = 0; c < colCount; c++) {
+        colWidth[c] = utf8DisplayWidth(headers[c]);
+        for (const auto& row : rows) {
+            if (c < row.size()) {
+                colWidth[c] = std::max(colWidth[c], utf8DisplayWidth(row[c]));
+            }
+        }
+    }
+
+    const std::string colGap = "  ";
+    const std::string sep = " | ";
+
+    auto printRow = [&](const std::vector<std::string>& cells) {
+        std::cout << colGap;
+        for (size_t c = 0; c < colCount; c++) {
+            std::string cell = (c < cells.size()) ? cells[c] : "";
+            bool isLast = (c + 1 == colCount);
+            std::cout << (isLast ? cell : padToWidth(cell, colWidth[c]));
+            if (!isLast) std::cout << sep;
+        }
+        std::cout << "\n";
+    };
+
+    printRow(headers);
+
+    size_t totalWidth = colGap.size();
+    for (size_t c = 0; c < colCount; c++) {
+        totalWidth += colWidth[c];
+        if (c + 1 != colCount) totalWidth += sep.size();
+    }
+    std::cout << colGap << std::string(totalWidth - colGap.size(), '-') << "\n";
+
+    for (const auto& row : rows) printRow(row);
+}
+
+// ============================================================
 // ГОСТ Р 34.11-2012 «Стрибог-512» (для хеширования паролей),
 // реализация с нуля по алгоритму стандарта / RFC 6986.
 //
@@ -1115,13 +1186,18 @@ static void runAdminPanel() {
                 std::cout << "Учётных записей пока нет.\n";
                 continue;
             }
-            std::cout << "\nЛогин \t| Email \t| Настройка 2-го/3-го фактора\n";
+            std::vector<std::vector<std::string>> rows;
+            rows.reserve(users.size());
             for (const auto& u : users) {
                 bool setupDone = !u.email.empty() && !u.totpSecretB32.empty();
-                std::cout << u.username << " \t| "
-                          << (u.email.empty() ? "(не задан)" : u.email) << " \t| "
-                          << (setupDone ? "завершена" : "ожидает первого входа пользователя") << "\n";
+                rows.push_back({
+                    u.username,
+                    u.email.empty() ? "(не задан)" : u.email,
+                    setupDone ? "завершена" : "ожидает первого входа пользователя"
+                });
             }
+            std::cout << "\n";
+            printAlignedTable({"Логин", "Email", "Настройка 2-го/3-го фактора"}, rows);
         } else if (choice == "2") {
             std::string newUsername;
             std::cout << "Логин новой учётной записи: ";
