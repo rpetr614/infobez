@@ -54,6 +54,7 @@
 #include <chrono>
 #include <thread>
 #include <cstdlib>
+#include <cctype>
 #include <filesystem>
 #include <curl/curl.h>
 
@@ -63,6 +64,19 @@
 #include <termios.h>
 #include <unistd.h>
 #endif
+
+// ============================================================
+// НАСТРОЙКИ (меняются здесь, в одном месте)
+// ============================================================
+// Включает/выключает требования к сложности пароля при регистрации
+// (строчные+заглавные буквы, цифра, спецсимвол, минимальная длина).
+// Поставьте false, если нужно быстро тестировать программу без
+// ограничений на пароль.
+static const bool ENFORCE_PASSWORD_REQUIREMENTS = true;
+
+// Минимальная длина пароля (используется только пока
+// ENFORCE_PASSWORD_REQUIREMENTS == true).
+static const int MIN_PASSWORD_LENGTH = 12;
 
 // ============================================================
 // Утилиты hex
@@ -735,6 +749,85 @@ static std::string hashPassword(const std::string& password, const std::string& 
 }
 
 // ============================================================
+// Требования к сложности пароля и автогенерация
+// ============================================================
+static const std::string PASSWORD_SPECIAL_CHARS = "!@#$%^&*()-_=+[]{};:,.<>/?";
+
+// Проверяет пароль на соответствие требованиям (строчные+заглавные буквы,
+// цифра, спецсимвол, минимальная длина). Если требования выключены
+// (ENFORCE_PASSWORD_REQUIREMENTS == false), всегда возвращает true.
+// В errorMsg при неудаче записывается список того, чего не хватает.
+static bool isPasswordStrongEnough(const std::string& password, std::string& errorMsg) {
+    if (!ENFORCE_PASSWORD_REQUIREMENTS) return true;
+
+    bool hasLower = false, hasUpper = false, hasDigit = false, hasSpecial = false;
+    for (char c : password) {
+        if (islower(static_cast<unsigned char>(c))) hasLower = true;
+        else if (isupper(static_cast<unsigned char>(c))) hasUpper = true;
+        else if (isdigit(static_cast<unsigned char>(c))) hasDigit = true;
+        else if (PASSWORD_SPECIAL_CHARS.find(c) != std::string::npos) hasSpecial = true;
+    }
+
+    std::vector<std::string> missing;
+    if (static_cast<int>(password.size()) < MIN_PASSWORD_LENGTH) {
+        missing.push_back("минимум " + std::to_string(MIN_PASSWORD_LENGTH) + " символов");
+    }
+    if (!hasLower) missing.push_back("строчная буква");
+    if (!hasUpper) missing.push_back("заглавная буква");
+    if (!hasDigit) missing.push_back("цифра");
+    if (!hasSpecial) missing.push_back("спецсимвол (" + PASSWORD_SPECIAL_CHARS + ")");
+
+    if (missing.empty()) return true;
+
+    errorMsg = "Пароль не соответствует требованиям. Не хватает: ";
+    for (size_t i = 0; i < missing.size(); i++) {
+        errorMsg += missing[i];
+        if (i + 1 < missing.size()) errorMsg += ", ";
+    }
+    errorMsg += ".\n";
+    return false;
+}
+
+// Генерирует надёжный случайный пароль, гарантированно удовлетворяющий
+// требованиям (строчная, заглавная, цифра, спецсимвол, нужная длина) —
+// независимо от того, включены требования или нет: раз пользователь
+// просит сгенерировать пароль, он должен быть действительно надёжным.
+static std::string generateStrongPassword(int length = 16) {
+    static const std::string lower = "abcdefghijklmnopqrstuvwxyz";
+    static const std::string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    static const std::string digits = "0123456789";
+    static const std::string& special = PASSWORD_SPECIAL_CHARS;
+
+    if (length < MIN_PASSWORD_LENGTH) length = MIN_PASSWORD_LENGTH;
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+
+    auto pick = [&](const std::string& set) {
+        std::uniform_int_distribution<size_t> dist(0, set.size() - 1);
+        return set[dist(gen)];
+    };
+
+    std::vector<char> pw;
+    pw.reserve(length);
+    // Гарантируем хотя бы по одному символу каждой категории.
+    pw.push_back(pick(lower));
+    pw.push_back(pick(upper));
+    pw.push_back(pick(digits));
+    pw.push_back(pick(special));
+
+    std::string allChars = lower + upper + digits + special;
+    while (static_cast<int>(pw.size()) < length) {
+        pw.push_back(pick(allChars));
+    }
+
+    // Перемешиваем, чтобы гарантированные символы не оказались всегда в начале.
+    std::shuffle(pw.begin(), pw.end(), gen);
+
+    return std::string(pw.begin(), pw.end());
+}
+
+// ============================================================
 // Хранение пользователей
 // ============================================================
 struct UserRecord {
@@ -805,10 +898,55 @@ static void registerUser() {
         return;
     }
 
-    std::string password = readHiddenInput("Придумайте пароль: ");
-    std::string password2 = readHiddenInput("Повторите пароль: ");
-    if (password.empty()) { std::cout << "Пароль не может быть пустым.\n"; return; }
-    if (password != password2) { std::cout << "Пароли не совпадают.\n"; return; }
+    // Выбор пароля: сгенерировать автоматически или ввести вручную.
+    std::string password;
+    if (ENFORCE_PASSWORD_REQUIREMENTS) {
+        std::cout << "Требования к паролю: минимум " << MIN_PASSWORD_LENGTH
+                  << " символов, строчные и заглавные буквы, цифра, спецсимвол.\n";
+    }
+    std::cout << "Сгенерировать надёжный пароль автоматически? (д/н): ";
+    std::string genChoice;
+    std::getline(std::cin, genChoice);
+    bool wantsGenerated = (genChoice == "д" || genChoice == "Д" ||
+                           genChoice == "y" || genChoice == "Y" || genChoice == "yes");
+
+    if (wantsGenerated) {
+        password = generateStrongPassword(16);
+        std::cout << "\nСгенерированный пароль: " << password << "\n"
+                  << "Сохраните его прямо сейчас в надёжном месте (менеджере паролей и т.п.) —\n"
+                  << "после подтверждения он больше нигде не будет показан.\n\n";
+        std::string confirm = readHiddenInput("Введите этот пароль ещё раз, чтобы подтвердить, что сохранили: ");
+        if (confirm != password) {
+            std::cout << "Подтверждение не совпадает со сгенерированным паролем. Регистрация отменена.\n";
+            return;
+        }
+    } else {
+        const int maxAttempts = 3;
+        bool ok = false;
+        for (int attempt = 1; attempt <= maxAttempts && !ok; attempt++) {
+            std::string p1 = readHiddenInput("Придумайте пароль: ");
+            std::string p2 = readHiddenInput("Повторите пароль: ");
+            if (p1.empty()) {
+                std::cout << "Пароль не может быть пустым.\n";
+                continue;
+            }
+            if (p1 != p2) {
+                std::cout << "Пароли не совпадают.\n";
+                continue;
+            }
+            std::string err;
+            if (!isPasswordStrongEnough(p1, err)) {
+                std::cout << err;
+                continue;
+            }
+            password = p1;
+            ok = true;
+        }
+        if (!ok) {
+            std::cout << "Не удалось задать пароль, соответствующий требованиям. Регистрация отменена.\n";
+            return;
+        }
+    }
 
     std::string salt = generateSalt();
     std::string pwHash = hashPassword(password, salt);
