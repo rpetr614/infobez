@@ -40,6 +40,17 @@
 // Формат строки: username;salt_hex;pwhash_hex;totp_secret_base32;email
 // (pwhash_hex теперь 128 hex-символов — 64 байта/512 бит Стрибога,
 // а не 64 hex-символа, как было у SHA-256)
+// У записей, созданных администратором, totp_secret_base32 и email
+// изначально пустые — владелец заполняет их сам при первом входе.
+//
+// Роли пользователей:
+//   - Обычный пользователь: регистрируется сам, сразу проходит
+//     все 3 фактора.
+//   - Admin: служебная учётная запись (см. ADMIN_USERNAME/ADMIN_PASSWORD
+//     в начале файла). Вход только по паролю (без TOTP/почты), открывает
+//     панель управления учётными записями: просмотр всех записей,
+//     создание новых (только логин+пароль — почту и TOTP пользователь
+//     привязывает сам при первом входе) и удаление существующих.
 
 #include <iostream>
 #include <fstream>
@@ -77,6 +88,18 @@ static const bool ENFORCE_PASSWORD_REQUIREMENTS = true;
 // Минимальная длина пароля (используется только пока
 // ENFORCE_PASSWORD_REQUIREMENTS == true).
 static const int MIN_PASSWORD_LENGTH = 12;
+
+// Имя служебной учётной записи администратора. Зарезервировано —
+// обычный пользователь не может зарегистрироваться под этим именем.
+static const std::string ADMIN_USERNAME = "Admin";
+
+// ВРЕМЕННО: пароль администратора лежит здесь открытым текстом,
+// чтобы его было легко найти и изменить и чтобы он не "потерялся".
+// Это временное решение — для реального использования нужно вынести
+// его из исходного кода (переменная окружения, отдельный защищённый
+// файл, ввод при первом запуске и т.п.). Не забудь заменить значение
+// по умолчанию перед тем, как давать доступ к программе кому-то ещё.
+static const std::string ADMIN_PASSWORD = "ChangeMe_Admin123!";
 
 // ============================================================
 // Утилиты hex
@@ -898,6 +921,27 @@ static bool isValidField(const std::string& s) {
     return !s.empty() && s.find(';') == std::string::npos;
 }
 
+// Разбивает строку на поля по ';' вручную (без std::stringstream +
+// std::getline), т.к. связка getline-по-';' некорректно обрабатывает
+// случай, когда последнее поле пустое и после него нет ни одного
+// символа (например, email у записи, созданной администратором,
+// который сам ничего не вводит помимо логина и пароля) — в этом
+// случае stream-парсинг просто "теряет" всю строку целиком.
+static std::vector<std::string> splitByDelimiter(const std::string& line, char delim) {
+    std::vector<std::string> fields;
+    size_t start = 0;
+    while (true) {
+        size_t pos = line.find(delim, start);
+        if (pos == std::string::npos) {
+            fields.push_back(line.substr(start));
+            break;
+        }
+        fields.push_back(line.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return fields;
+}
+
 static std::vector<UserRecord> loadUsers() {
     std::vector<UserRecord> users;
     std::ifstream in(USERS_FILE);
@@ -905,15 +949,9 @@ static std::vector<UserRecord> loadUsers() {
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string username, salt, hash, totpSecret, email;
-        if (std::getline(ss, username, ';') &&
-            std::getline(ss, salt, ';') &&
-            std::getline(ss, hash, ';') &&
-            std::getline(ss, totpSecret, ';') &&
-            std::getline(ss, email, ';')) {
-            users.push_back({username, salt, hash, totpSecret, email});
-        }
+        auto fields = splitByDelimiter(line, ';');
+        if (fields.size() != 5) continue; // повреждённая/некорректная строка — пропускаем
+        users.push_back({fields[0], fields[1], fields[2], fields[3], fields[4]});
     }
     return users;
 }
@@ -962,6 +1000,45 @@ static bool updateUserPassword(const std::string& username, const std::string& n
     return rewriteAllUsers(users);
 }
 
+// Удаляет пользователя по логину. Возвращает false, если пользователь
+// не найден или не удалось записать файл.
+static bool deleteUserByUsername(const std::string& username) {
+    auto users = loadUsers();
+    size_t before = users.size();
+    users.erase(std::remove_if(users.begin(), users.end(),
+        [&](const UserRecord& u) { return u.username == username; }), users.end());
+    if (users.size() == before) return false;
+    return rewriteAllUsers(users);
+}
+
+// Создаёт учётную запись только с логином и паролем (без email и без
+// TOTP-секрета) — используется администратором. Привязку почты и
+// второго фактора владелец записи должен будет выполнить сам при
+// первом входе (см. completeUserSetup / loginUser).
+static bool addBasicUser(const std::string& username, const std::string& password) {
+    std::string salt = generateSalt();
+    std::string pwHash = hashPassword(password, salt);
+    return saveUser({username, salt, pwHash, "", ""});
+}
+
+// Завершает настройку учётной записи, созданной администратором:
+// записывает email и TOTP-секрет пользователю, у которого они ещё
+// не заданы. Остальные поля (логин, соль, хеш пароля) не трогает.
+static bool completeUserSetup(const std::string& username, const std::string& email, const std::string& totpSecretB32) {
+    auto users = loadUsers();
+    bool found = false;
+    for (auto& u : users) {
+        if (u.username == username) {
+            u.email = email;
+            u.totpSecretB32 = totpSecretB32;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+    return rewriteAllUsers(users);
+}
+
 // ============================================================
 // Регистрация
 // ============================================================
@@ -972,6 +1049,10 @@ static void registerUser() {
     std::cout << "Придумайте логин: ";
     std::getline(std::cin, username);
     if (!isValidField(username)) { std::cout << "Некорректный логин.\n"; return; }
+    if (username == ADMIN_USERNAME) {
+        std::cout << "Это имя зарезервировано, выберите другой логин.\n";
+        return;
+    }
     if (usernameExists(users, username)) { std::cout << "Такой логин уже занят.\n"; return; }
 
     std::string email;
@@ -1011,14 +1092,148 @@ static void registerUser() {
 }
 
 // ============================================================
+// Панель администратора
+// ============================================================
+// Доступна только под служебной учётной записью Admin (см. ADMIN_USERNAME
+// / ADMIN_PASSWORD выше). Проверяется только пароль — без TOTP и без
+// почты, т.к. это единая служебная запись, а не аккаунт с почтой.
+static void runAdminPanel() {
+    while (true) {
+        auto users = loadUsers();
+
+        std::cout << "\n--- Панель администратора ---\n"
+                  << "1. Показать все учётные записи\n"
+                  << "2. Добавить новую учётную запись (только логин+пароль)\n"
+                  << "3. Удалить учётную запись\n"
+                  << "4. Выйти из панели администратора\n"
+                  << "Выберите пункт: ";
+        std::string choice;
+        std::getline(std::cin, choice);
+
+        if (choice == "1") {
+            if (users.empty()) {
+                std::cout << "Учётных записей пока нет.\n";
+                continue;
+            }
+            std::cout << "\nЛогин \t| Email \t| Настройка 2-го/3-го фактора\n";
+            for (const auto& u : users) {
+                bool setupDone = !u.email.empty() && !u.totpSecretB32.empty();
+                std::cout << u.username << " \t| "
+                          << (u.email.empty() ? "(не задан)" : u.email) << " \t| "
+                          << (setupDone ? "завершена" : "ожидает первого входа пользователя") << "\n";
+            }
+        } else if (choice == "2") {
+            std::string newUsername;
+            std::cout << "Логин новой учётной записи: ";
+            std::getline(std::cin, newUsername);
+            if (!isValidField(newUsername) || newUsername == ADMIN_USERNAME) {
+                std::cout << "Некорректный или зарезервированный логин.\n";
+                continue;
+            }
+            if (usernameExists(users, newUsername)) {
+                std::cout << "Такой логин уже занят.\n";
+                continue;
+            }
+            std::string newPassword = choosePassword();
+            if (newPassword.empty()) {
+                std::cout << "Создание учётной записи отменено.\n";
+                continue;
+            }
+            if (!addBasicUser(newUsername, newPassword)) {
+                std::cout << "Ошибка: не удалось создать учётную запись.\n";
+                continue;
+            }
+            std::cout << "Учётная запись \"" << newUsername << "\" создана (только логин и пароль).\n"
+                      << "Владелец должен будет привязать email и настроить TOTP при первом входе.\n";
+        } else if (choice == "3") {
+            std::string delUsername;
+            std::cout << "Логин учётной записи для удаления: ";
+            std::getline(std::cin, delUsername);
+            if (delUsername == ADMIN_USERNAME) {
+                std::cout << "Служебную запись Admin удалить нельзя.\n";
+                continue;
+            }
+            std::string confirm;
+            std::cout << "Точно удалить \"" << delUsername << "\"? Это необратимо (д/н): ";
+            std::getline(std::cin, confirm);
+            if (confirm != "д" && confirm != "Д" && confirm != "y" && confirm != "Y") {
+                std::cout << "Удаление отменено.\n";
+                continue;
+            }
+            if (!deleteUserByUsername(delUsername)) {
+                std::cout << "Пользователь не найден.\n";
+                continue;
+            }
+            std::cout << "Учётная запись \"" << delUsername << "\" удалена.\n";
+        } else if (choice == "4") {
+            std::cout << "Выход из панели администратора.\n";
+            return;
+        } else {
+            std::cout << "Некорректный выбор, попробуйте снова.\n";
+        }
+    }
+}
+
+// Первый вход в учётную запись, созданную администратором (у неё ещё
+// нет email и TOTP-секрета): просим владельца привязать почту и
+// сгенерировать TOTP-секрет, прежде чем продолжать обычный вход.
+// Возвращает true, если настройка успешно завершена (и users/it
+// нужно перечитать), false — если пользователь прервал процесс.
+static bool completeFirstLoginSetup(const std::string& username) {
+    std::cout << "\nЭта учётная запись была создана администратором и ещё не имеет\n"
+              << "привязанной почты и настроенного TOTP. Нужно завершить настройку,\n"
+              << "прежде чем продолжить вход.\n";
+
+    std::string email;
+    std::cout << "Введите email (для третьего фактора): ";
+    std::getline(std::cin, email);
+    if (!isValidField(email) || email.find('@') == std::string::npos) {
+        std::cout << "Некорректный email. Вход отменён.\n";
+        return false;
+    }
+
+    std::string totpSecret = generateTotpSecretBase32();
+    if (!completeUserSetup(username, email, totpSecret)) {
+        std::cout << "Ошибка: не удалось сохранить настройки. Вход отменён.\n";
+        return false;
+    }
+
+    std::string issuer = "MyConsoleApp";
+    std::string otpauthUri = "otpauth://totp/" + issuer + ":" + username +
+        "?secret=" + totpSecret + "&issuer=" + issuer + "&digits=" +
+        std::to_string(totpDigits) + "&period=" + std::to_string(totpPeriod);
+
+    std::cout << "\nНастройка завершена!\n"
+              << "Секрет для приложения-аутентификатора (Google Authenticator/Authy):\n"
+              << "  " << totpSecret << "\n"
+              << "Либо добавьте вручную по ссылке (можно превратить в QR-код на любом онлайн-генераторе):\n"
+              << "  " << otpauthUri << "\n\n"
+              << "Продолжаем вход...\n\n";
+    return true;
+}
+
+// ============================================================
 // Вход: 3 фактора последовательно
 // ============================================================
 static void loginUser(const SmtpConfig& smtpConfig) {
-    auto users = loadUsers();
-
     std::string username;
     std::cout << "Логин: ";
     std::getline(std::cin, username);
+
+    // Служебная учётная запись администратора: только пароль,
+    // без TOTP и без email — см. ADMIN_USERNAME/ADMIN_PASSWORD.
+    if (username == ADMIN_USERNAME) {
+        std::string adminPassword = readHiddenInput("Пароль администратора: ");
+        if (adminPassword != ADMIN_PASSWORD) {
+            std::cout << "Неверный логин или пароль.\n";
+            return;
+        }
+        std::cout << "\nВход выполнен: администратор.\n";
+        runAdminPanel();
+        return;
+    }
+
+    auto users = loadUsers();
 
     auto it = std::find_if(users.begin(), users.end(),
         [&](const UserRecord& u) { return u.username == username; });
@@ -1030,6 +1245,20 @@ static void loginUser(const SmtpConfig& smtpConfig) {
         return;
     }
     std::cout << "Фактор 1 (пароль) пройден.\n";
+
+    // Учётная запись создана администратором и ещё не имеет email/TOTP —
+    // сначала нужно завершить её настройку.
+    if (it->email.empty() || it->totpSecretB32.empty()) {
+        if (!completeFirstLoginSetup(username)) return;
+        // Перечитываем пользователя с уже заполненными полями.
+        users = loadUsers();
+        it = std::find_if(users.begin(), users.end(),
+            [&](const UserRecord& u) { return u.username == username; });
+        if (it == users.end()) {
+            std::cout << "Ошибка: учётная запись не найдена после настройки.\n";
+            return;
+        }
+    }
 
     // Фактор 2: TOTP
     std::string totpCode;
