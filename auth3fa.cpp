@@ -827,6 +827,58 @@ static std::string generateStrongPassword(int length = 16) {
     return std::string(pw.begin(), pw.end());
 }
 
+// Общий диалог выбора пароля — используется и при регистрации, и при
+// восстановлении пароля: пользователь может сгенерировать надёжный
+// пароль автоматически или ввести свой вручную (с проверкой требований,
+// если ENFORCE_PASSWORD_REQUIREMENTS == true). Возвращает выбранный
+// пароль, либо пустую строку, если операция отменена/не удалась.
+static std::string choosePassword() {
+    if (ENFORCE_PASSWORD_REQUIREMENTS) {
+        std::cout << "Требования к паролю: минимум " << MIN_PASSWORD_LENGTH
+                  << " символов, строчные и заглавные буквы, цифра, спецсимвол.\n";
+    }
+    std::cout << "Сгенерировать надёжный пароль автоматически? (д/н): ";
+    std::string genChoice;
+    std::getline(std::cin, genChoice);
+    bool wantsGenerated = (genChoice == "д" || genChoice == "Д" ||
+                           genChoice == "y" || genChoice == "Y" || genChoice == "yes");
+
+    if (wantsGenerated) {
+        std::string password = generateStrongPassword(16);
+        std::cout << "\nСгенерированный пароль: " << password << "\n"
+                  << "Сохраните его прямо сейчас в надёжном месте (менеджере паролей и т.п.) —\n"
+                  << "после подтверждения он больше нигде не будет показан.\n\n";
+        std::string confirm = readHiddenInput("Введите этот пароль ещё раз, чтобы подтвердить, что сохранили: ");
+        if (confirm != password) {
+            std::cout << "Подтверждение не совпадает со сгенерированным паролем.\n";
+            return "";
+        }
+        return password;
+    }
+
+    const int maxAttempts = 3;
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        std::string p1 = readHiddenInput("Придумайте пароль: ");
+        std::string p2 = readHiddenInput("Повторите пароль: ");
+        if (p1.empty()) {
+            std::cout << "Пароль не может быть пустым.\n";
+            continue;
+        }
+        if (p1 != p2) {
+            std::cout << "Пароли не совпадают.\n";
+            continue;
+        }
+        std::string err;
+        if (!isPasswordStrongEnough(p1, err)) {
+            std::cout << err;
+            continue;
+        }
+        return p1;
+    }
+    std::cout << "Не удалось задать пароль, соответствующий требованиям.\n";
+    return "";
+}
+
 // ============================================================
 // Хранение пользователей
 // ============================================================
@@ -878,6 +930,38 @@ static bool usernameExists(const std::vector<UserRecord>& users, const std::stri
     return std::any_of(users.begin(), users.end(), [&](const UserRecord& u) { return u.username == username; });
 }
 
+// Полностью перезаписывает users.txt текущим содержимым списка —
+// нужно для обновления пароля существующего пользователя (saveUser
+// только дописывает новые записи в конец, для смены пароля этого
+// недостаточно).
+static bool rewriteAllUsers(const std::vector<UserRecord>& users) {
+    std::ofstream out(USERS_FILE, std::ios::trunc);
+    if (!out.is_open()) return false;
+    for (const auto& u : users) {
+        out << u.username << ';' << u.saltHex << ';' << u.pwHashHex << ';'
+            << u.totpSecretB32 << ';' << u.email << '\n';
+    }
+    return true;
+}
+
+// Обновляет соль и хеш пароля конкретного пользователя, остальные поля
+// (TOTP-секрет, email) не трогает. Возвращает false, если пользователь
+// не найден или не удалось записать файл.
+static bool updateUserPassword(const std::string& username, const std::string& newSaltHex, const std::string& newPwHash) {
+    auto users = loadUsers();
+    bool found = false;
+    for (auto& u : users) {
+        if (u.username == username) {
+            u.saltHex = newSaltHex;
+            u.pwHashHex = newPwHash;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+    return rewriteAllUsers(users);
+}
+
 // ============================================================
 // Регистрация
 // ============================================================
@@ -899,53 +983,10 @@ static void registerUser() {
     }
 
     // Выбор пароля: сгенерировать автоматически или ввести вручную.
-    std::string password;
-    if (ENFORCE_PASSWORD_REQUIREMENTS) {
-        std::cout << "Требования к паролю: минимум " << MIN_PASSWORD_LENGTH
-                  << " символов, строчные и заглавные буквы, цифра, спецсимвол.\n";
-    }
-    std::cout << "Сгенерировать надёжный пароль автоматически? (д/н): ";
-    std::string genChoice;
-    std::getline(std::cin, genChoice);
-    bool wantsGenerated = (genChoice == "д" || genChoice == "Д" ||
-                           genChoice == "y" || genChoice == "Y" || genChoice == "yes");
-
-    if (wantsGenerated) {
-        password = generateStrongPassword(16);
-        std::cout << "\nСгенерированный пароль: " << password << "\n"
-                  << "Сохраните его прямо сейчас в надёжном месте (менеджере паролей и т.п.) —\n"
-                  << "после подтверждения он больше нигде не будет показан.\n\n";
-        std::string confirm = readHiddenInput("Введите этот пароль ещё раз, чтобы подтвердить, что сохранили: ");
-        if (confirm != password) {
-            std::cout << "Подтверждение не совпадает со сгенерированным паролем. Регистрация отменена.\n";
-            return;
-        }
-    } else {
-        const int maxAttempts = 3;
-        bool ok = false;
-        for (int attempt = 1; attempt <= maxAttempts && !ok; attempt++) {
-            std::string p1 = readHiddenInput("Придумайте пароль: ");
-            std::string p2 = readHiddenInput("Повторите пароль: ");
-            if (p1.empty()) {
-                std::cout << "Пароль не может быть пустым.\n";
-                continue;
-            }
-            if (p1 != p2) {
-                std::cout << "Пароли не совпадают.\n";
-                continue;
-            }
-            std::string err;
-            if (!isPasswordStrongEnough(p1, err)) {
-                std::cout << err;
-                continue;
-            }
-            password = p1;
-            ok = true;
-        }
-        if (!ok) {
-            std::cout << "Не удалось задать пароль, соответствующий требованиям. Регистрация отменена.\n";
-            return;
-        }
+    std::string password = choosePassword();
+    if (password.empty()) {
+        std::cout << "Регистрация отменена.\n";
+        return;
     }
 
     std::string salt = generateSalt();
@@ -1025,6 +1066,71 @@ static void loginUser(const SmtpConfig& smtpConfig) {
 }
 
 // ============================================================
+// Восстановление пароля через email
+// ============================================================
+// Пользователь подтверждает владение почтой, привязанной к аккаунту
+// (код приходит туда же, куда и код третьего фактора при входе), и
+// после этого задаёт новый пароль. TOTP-секрет и email при этом не
+// меняются — обновляются только соль и хеш пароля.
+static void recoverPassword(const SmtpConfig& smtpConfig) {
+    auto users = loadUsers();
+
+    std::string username;
+    std::cout << "Логин, для которого восстанавливаем пароль: ";
+    std::getline(std::cin, username);
+
+    auto it = std::find_if(users.begin(), users.end(),
+        [&](const UserRecord& u) { return u.username == username; });
+
+    // Не подтверждаем и не опровергаем существование пользователя явно —
+    // иначе по ответу программы можно было бы угадывать чужие логины.
+    const std::string neutralMsg =
+        "Если пользователь с таким именем существует, код восстановления "
+        "отправлен на привязанную к нему почту.\n";
+
+    if (it == users.end()) {
+        std::cout << neutralMsg;
+        return;
+    }
+
+    std::string code = generateNumericCode(6);
+    sendEmailCode(smtpConfig, it->email, code);
+    std::cout << neutralMsg;
+
+    const int maxAttempts = 3;
+    bool codeOk = false;
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        std::string entered;
+        std::cout << "Введите код с почты (попытка " << attempt << "/" << maxAttempts << "): ";
+        std::getline(std::cin, entered);
+        if (entered == code) { codeOk = true; break; }
+        std::cout << "Код неверный.\n";
+    }
+
+    if (!codeOk) {
+        std::cout << "Не удалось подтвердить код. Восстановление пароля отменено.\n";
+        return;
+    }
+
+    std::cout << "Код подтверждён. Придумайте новый пароль.\n";
+    std::string newPassword = choosePassword();
+    if (newPassword.empty()) {
+        std::cout << "Восстановление пароля отменено.\n";
+        return;
+    }
+
+    std::string newSalt = generateSalt();
+    std::string newHash = hashPassword(newPassword, newSalt);
+
+    if (!updateUserPassword(username, newSalt, newHash)) {
+        std::cout << "Ошибка: не удалось сохранить новый пароль.\n";
+        return;
+    }
+
+    std::cout << "Пароль успешно изменён. Теперь можно войти с новым паролем.\n";
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -1042,7 +1148,8 @@ int main() {
         std::cout << "\nМеню:\n"
                   << "1. Регистрация\n"
                   << "2. Вход\n"
-                  << "3. Выход из программы\n"
+                  << "3. Восстановить пароль\n"
+                  << "4. Выход из программы\n"
                   << "Выберите пункт: ";
 
         std::string choice;
@@ -1050,7 +1157,8 @@ int main() {
 
         if (choice == "1") registerUser();
         else if (choice == "2") loginUser(smtpConfig);
-        else if (choice == "3") { std::cout << "Завершение работы.\n"; break; }
+        else if (choice == "3") recoverPassword(smtpConfig);
+        else if (choice == "4") { std::cout << "Завершение работы.\n"; break; }
         else std::cout << "Некорректный выбор, попробуйте снова.\n";
     }
 
