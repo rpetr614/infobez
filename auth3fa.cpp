@@ -19,6 +19,9 @@
 // Компиляция (нужен libcurl — на macOS обычно уже есть вместе с Xcode CLT):
 //   g++ -std=c++17 -O2 -o auth3fa auth3fa.cpp -lcurl
 //
+// Проверка корректности Стрибога-512:
+//   ./auth3fa --selftest
+//
 // При первом запуске программа сама спросит:
 //   - Gmail-адрес, с которого будут отправляться коды
 //   - пароль приложения Gmail (НЕ обычный пароль от аккаунта!
@@ -1443,9 +1446,67 @@ static void recoverPassword(const SmtpConfig& smtpConfig) {
 }
 
 // ============================================================
+// Самопроверка Стрибога-512: ./auth3fa --selftest
+// ============================================================
+// Сверяет реализацию с эталонными значениями (получены независимой
+// эталонной реализацией). Покрывает пустую строку, тестовый вектор M1 из
+// RFC 6986 и границы блоков (63/64/65/128/129 байт), чтобы поймать ошибки
+// паддинга и обработки последнего блока.
+static int runStreebogSelfTest() {
+    struct Vec { const char* name; std::string input; const char* expected; };
+    const std::vector<Vec> vectors = {
+        {"пустая строка",
+         std::string(),
+         "8e945da209aa869f0455928529bcae4679e9873ab707b55315f56ceb98bef0a7362f715528356ee83cda5f2aac4c6ad2ba3a715c1bcd81cb8e9f90bf4c1c1a8a"},
+        {"M1 из RFC 6986 (63 символа)",
+         std::string("012345678901234567890123456789012345678901234567890123456789012"),
+         "1b54d01a4af5b9d5cc3d86d68d285462b19abc2475222f35c085122be4ba1ffa00ad30f8767b3a82384c6574f024c311e2a481332b08ef7f41797891c1646f48"},
+        {"строка abc",
+         std::string("abc"),
+         "28156e28317da7c98f4fe2bed6b542d0dab85bb224445fcedaf75d46e26d7eb8d5997f3e0915dd6b7f0aab08d9c8beb0d8c64bae2ab8b3c8c6bc53b3bf0db728"},
+        {"'a' x 64 (ровно один блок)",
+         std::string(64, 'a'),
+         "613852076ca11156cf7d00f4feef0d5e3198e638f8e20eb02da2f5f7dca5b62dd9fb88e22e825f727ed6f25e4145dc868d0ef41e3e451e34b780e5547ade0d43"},
+        {"'a' x 65",
+         std::string(65, 'a'),
+         "42baf8f1711d47b6de63559743d09f5e11c9a348bea73b8bb3fe11be0ec0f6029856d70b936a00f7414b5f1ebd8e2bdaa74f3a893b90978da9cadcb72ae50338"},
+        {"'a' x 128 (два блока)",
+         std::string(128, 'a'),
+         "24741e27419b5e5796383cc54a915c5a69322c758f4391f48f2f120d832f840a82c4a23528d15612febfd2647ce64a97ba6ead9686617876f2d197087b47280f"},
+        {"'a' x 129",
+         std::string(129, 'a'),
+         "14ae98a06eedc746250d75a7c961ae7b058f5408f7c221df81b229935a3f6c134c704c6b431eb52b5ebcee51ea83d5f894415166c203ba3c740af1c43f610b5a"},
+        {"0xFF x 64",
+         std::string(64, '\xff'),
+         "41629de677d7e8090c3cd70affe3300d1e1cfba2db97945ec37feb4e1375bc02a53f00370b7d715b07f37f93cac844efadbfd1b85f9ddae3de9656c0e95affc7"},
+        {"0x00 x 64",
+         std::string(64, '\0'),
+         "b0fd29ac1b0df441769ff3fdb8dc564df67721d6ac06fb28ceffb7bbaa7948c6c014ac999235b58cb26fb60fb112a145d7b4ade9ae566bf2611402c552d20db7"},
+    };
+    int failed = 0;
+    for (const auto& v : vectors) {
+        std::string got = streebog512Hex(v.input);
+        bool ok = (got == v.expected);
+        std::cout << (ok ? "[OK]   " : "[FAIL] ") << v.name << "\n";
+        if (!ok) {
+            std::cout << "       ожидалось: " << v.expected << "\n"
+                      << "       получено:  " << got << "\n";
+            failed++;
+        }
+    }
+    std::cout << "\nИтог: " << (vectors.size() - failed) << " из " << vectors.size()
+              << " тестов пройдено. "
+              << (failed == 0 ? "Стрибог-512 работает корректно.\n" : "ЕСТЬ ОШИБКИ в реализации!\n");
+    return failed == 0 ? 0 : 1;
+}
+
+// ============================================================
 // main
 // ============================================================
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--selftest") {
+        return runStreebogSelfTest();
+    }
     // Автоматический flush после каждого вывода — иначе при перенаправлении
     // stdin/stdout (например, в тестах или через pipe) подсказки могут
     // "застрять" в буфере и программа будет выглядеть зависшей.
