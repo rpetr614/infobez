@@ -757,13 +757,20 @@ static bool sendEmailReal(const SmtpConfig& cfg, const std::string& toEmail, con
     curl_easy_setopt(curl, CURLOPT_READFUNCTION, smtpReadCallback);
     curl_easy_setopt(curl, CURLOPT_READDATA, &upload);
     curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    // Только IPv4: если IPv6-маршрут до Gmail «висит», curl иначе может
+    // ждать до таймаута, хотя по IPv4 всё работает.
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, (long)CURL_IPRESOLVE_V4);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    // Подробный текст ошибки от curl (на каком этапе остановились).
+    char errbuf[CURL_ERROR_SIZE] = {0};
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
     CURLcode res = curl_easy_perform(curl);
     bool ok = (res == CURLE_OK);
     if (!ok) {
         std::cout << "[SMTP] Ошибка отправки: " << curl_easy_strerror(res) << "\n";
+        if (errbuf[0] != '\0') std::cout << "[SMTP] Подробности: " << errbuf << "\n";
     }
 
     curl_slist_free_all(recipients);
