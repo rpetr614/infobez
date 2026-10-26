@@ -16,11 +16,23 @@
 // побайтово с проверенной эталонной реализацией. Собственных таблиц
 // "на память" здесь нет — использованы сверенные значения.
 //
-// Компиляция (нужен libcurl — на macOS обычно уже есть вместе с Xcode CLT):
-//   g++ -std=c++17 -O2 -o auth3fa auth3fa.cpp -lcurl
+// После входа (все 3 фактора) пользователь попадает в меню сообщений:
+//   - шифрование сообщения «Кузнечиком» (ГОСТ Р 34.12-2015, CTR + OMAC)
+//     или RSA-32768 (OAEP со Стрибогом-512, GMP, CRT, многопоточность);
+//   - список, расшифрование, PDF-отчёт со всеми сообщениями и их
+//     расшифровкой. См. kuznyechik.hpp, rsa_gmp.hpp, pdf_writer.hpp.
 //
-// Проверка корректности Стрибога-512:
+// Компиляция (нужны libcurl и GMP; на macOS: brew install gmp):
+//   make
+// или вручную (macOS + Homebrew):
+//   g++ -std=c++17 -O2 -I$(brew --prefix gmp)/include -o auth3fa auth3fa.cpp
+//       -L$(brew --prefix gmp)/lib -lcurl -lgmp -pthread      (одной строкой)
+//
+// Проверка по контрольным примерам ГОСТ (Стрибог-256/512, HMAC, Кузнечик,
+// режимы ГОСТ Р 34.13) и RSA-OAEP; примеры ГОСТ проверяются и при каждом запуске:
 //   ./auth3fa --selftest
+// Замеры производительности и статистика (Стрибог, Кузнечик, RSA-32768):
+//   ./auth3fa --bench
 //
 // При первом запуске программа сама спросит:
 //   - Gmail-адрес, с которого будут отправляться коды
@@ -61,6 +73,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <map>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -70,7 +83,17 @@
 #include <cstdlib>
 #include <cctype>
 #include <filesystem>
+#include <ctime>
+#include <iomanip>
+#include <cmath>
 #include <curl/curl.h>
+
+#include "secure_random.hpp"   // CSPRNG ОС (/dev/urandom / BCryptGenRandom)
+#include "kuznyechik.hpp"      // ГОСТ Р 34.12-2015 «Кузнечик» + режимы ГОСТ Р 34.13-2015
+#include "rsa_gmp.hpp"         // RSA-32768 на GMP: параллельная генерация, OAEP, CRT
+#include "pdf_writer.hpp"      // PDF с кириллицей без внешних библиотек
+#include "gost3410.hpp"        // ЭЦП ГОСТ Р 34.10-2012 на эллиптических кривых
+#include "pdf_signature.hpp"   // подпись PDF: сертификат X.509 + CMS, проверка
 
 #ifdef _WIN32
 #include <windows.h>
@@ -190,6 +213,52 @@ static void printAlignedTable(const std::vector<std::string>& headers,
 }
 
 // ============================================================
+// ASCII-таблицы с рамкой (консоль и PDF)
+// ============================================================
+//   +----+----------+
+//   | №  | Значение |
+//   +----+----------+
+//   |  1 | ...      |
+//   +----+----------+
+// Строка из одного элемента "---" рисует разделитель внутри таблицы.
+// Ширина считается по числу символов UTF-8 (кириллица = 1 символ).
+enum class Align { Left, Right };
+
+static std::vector<std::string> asciiTable(const std::vector<std::string>& headers,
+                                           const std::vector<std::vector<std::string>>& rows,
+                                           const std::vector<Align>& align = {}) {
+    const size_t cols = headers.size();
+    std::vector<size_t> w(cols);
+    for (size_t c = 0; c < cols; c++) w[c] = utf8DisplayWidth(headers[c]);
+    for (const auto& r : rows) {
+        if (r.size() == 1 && r[0] == "---") continue;
+        for (size_t c = 0; c < cols && c < r.size(); c++) w[c] = std::max(w[c], utf8DisplayWidth(r[c]));
+    }
+    std::string sep = "+";
+    for (size_t c = 0; c < cols; c++) sep += std::string(w[c] + 2, '-') + "+";
+    auto line = [&](const std::vector<std::string>& cells, bool header) {
+        std::string s = "|";
+        for (size_t c = 0; c < cols; c++) {
+            std::string cell = c < cells.size() ? cells[c] : "";
+            size_t pad = w[c] - utf8DisplayWidth(cell);
+            bool right = !header && c < align.size() && align[c] == Align::Right;
+            s += " " + (right ? std::string(pad, ' ') + cell : cell + std::string(pad, ' ')) + " |";
+        }
+        return s;
+    };
+    std::vector<std::string> out{sep, line(headers, true), sep};
+    for (const auto& r : rows) out.push_back((r.size() == 1 && r[0] == "---") ? sep : line(r, false));
+    out.push_back(sep);
+    return out;
+}
+
+static void printAsciiTable(const std::vector<std::string>& headers,
+                            const std::vector<std::vector<std::string>>& rows,
+                            const std::vector<Align>& align = {}) {
+    for (const auto& l : asciiTable(headers, rows, align)) std::cout << l << "\n";
+}
+
+// ============================================================
 // ГОСТ Р 34.11-2012 «Стрибог-512» (для хеширования паролей),
 // реализация с нуля по алгоритму стандарта / RFC 6986.
 //
@@ -203,6 +272,7 @@ static void printAlignedTable(const std::vector<std::string>& headers,
 namespace streebog512impl {
 
 // S-блок (таблица подстановки Pi), 256 значений — RFC 6986 §Приложение.
+constexpr int PI_LINE = __LINE__ + 1;      // для отчёта самопроверки: где задана таблица
 static const uint8_t Pi[256] = {
     252,238,221,17,207,110,49,22,251,196,250,218,35,197,4,77,
     233,119,240,219,147,46,153,186,23,54,241,187,20,205,95,193,
@@ -224,9 +294,11 @@ static const uint8_t Pi[256] = {
 
 // Перестановка Tau — транспонирование байтов как матрицы 8x8
 // (Tau[i] = (i%8)*8 + i/8); совпадает с таблицей из RFC 6986.
+constexpr int TAU_LINE = __LINE__ + 1;
 static uint8_t makeTauEntry(int i) { return static_cast<uint8_t>((i % 8) * 8 + (i / 8)); }
 
 // 64 константы линейного преобразования L — RFC 6986 §6.4 (матрица A).
+constexpr int A_LINE = __LINE__ + 1;
 static const uint64_t A[64] = {
     0x8e20faa72ba0b470ULL,0x47107ddd9b505a38ULL,0xad08b0e0c3282d1cULL,0xd8045870ef14980eULL,
     0x6c022c38f90a4c07ULL,0x3601161cf205268dULL,0x1b8e0b0e798c13c8ULL,0x83478b07b2468764ULL,
@@ -250,6 +322,7 @@ static const uint64_t A[64] = {
 // эталонной реализации ядра Linux (каждая — 8 слов qword[0..7], где
 // qword[0] хранит младшие 64 бита, qword[7] — старшие) и сверены с
 // официальным текстом RFC 6986.
+constexpr int C_LINE = __LINE__ + 1;
 static const uint64_t C_qwords[12][8] = {
  {0xdd806559f2a64507ULL,0x05767436cc744d23ULL,0xa2422a08a460d315ULL,0x4b7ce09192676901ULL,
   0x714eb88d7585c4fcULL,0x2f6a76432e45d016ULL,0xebcb2f81c0657c1fULL,0xb1085bda1ecadae9ULL},
@@ -313,20 +386,38 @@ static Block512 applyPS(const Block512& data) {
 }
 
 // L: линейное преобразование — каждое из 8 64-битных слов (little-endian)
-// умножается на матрицу A (проверяем биты от старшего (63) к младшему (0)).
+// умножается на матрицу A. Бит номер b слова (0 — младший) соответствует
+// строке A[63 - b].
+//
+// Оптимизация: L линейно над GF(2), поэтому результат для слова равен XOR
+// вкладов его 8 байтов. Вклад каждого из 256 значений байта в каждой из
+// 8 позиций предвычисляется один раз (таблица 8x256 слов = 16 КБ), и
+// вместо 64 проверок битов делается 8 обращений к таблице. Это ускоряет
+// хеш в десятки раз; корректность подтверждается --selftest.
+constexpr int LTABLE_LINE = __LINE__ + 1;
+struct LTable {
+    uint64_t t[8][256];
+    LTable() {
+        for (int pos = 0; pos < 8; pos++) {
+            for (int v = 0; v < 256; v++) {
+                uint64_t acc = 0;
+                for (int k = 0; k < 8; k++) {
+                    if (v & (1 << k)) acc ^= A[63 - (pos * 8 + k)];
+                }
+                t[pos][v] = acc;
+            }
+        }
+    }
+};
+static const LTable& lTable() { static const LTable tbl; return tbl; }
+
 static Block512 applyL(const Block512& data) {
     Block512 out{};
+    const LTable& T = lTable();
     for (int i = 0; i < 8; i++) {
-        uint64_t val = 0;
-        for (int j = 0; j < 8; j++) {
-            val |= static_cast<uint64_t>(data[i*8 + j]) << (j*8);
-        }
         uint64_t res64 = 0;
-        for (int j = 0; j < 64; j++) {
-            if (val & 0x8000000000000000ULL) {
-                res64 ^= A[j];
-            }
-            val <<= 1;
+        for (int j = 0; j < 8; j++) {
+            res64 ^= T.t[j][data[i*8 + j]];
         }
         for (int j = 0; j < 8; j++) {
             out[i*8 + j] = static_cast<uint8_t>((res64 >> (j*8)) & 0xff);
@@ -370,8 +461,14 @@ static Block512 add512(const Block512& a, const Block512& b) {
     return r;
 }
 
-static std::vector<uint8_t> streebog512(const std::string& message) {
-    Block512 hsh{};   // IV для 512-битного варианта — все нули
+// Общее ядро для обоих вариантов стандарта. Варианты отличаются только
+// начальным вектором: IV = 0^512 для 512 бит и IV = (00000001)^64 для
+// 256 бит; результат 256-битного варианта — старшие 256 бит (в нашем
+// little-endian представлении это байты [32..64)).
+constexpr int CORE_LINE = __LINE__ + 1;
+static std::vector<uint8_t> streebogCore(const std::string& message, bool variant256) {
+    Block512 hsh{};   // IV
+    if (variant256) hsh.fill(0x01);
     Block512 chk{};   // накопитель Σ
     uint64_t n = 0;    // накопитель N (в битах)
 
@@ -404,13 +501,20 @@ static std::vector<uint8_t> streebog512(const std::string& message) {
     hsh = g(0, hsh, nBlock);
     hsh = g(0, hsh, chk);
 
+    if (variant256) return std::vector<uint8_t>(hsh.begin() + 32, hsh.end());
     return std::vector<uint8_t>(hsh.begin(), hsh.end());
 }
+
+static std::vector<uint8_t> streebog512(const std::string& message) { return streebogCore(message, false); }
+static std::vector<uint8_t> streebog256(const std::string& message) { return streebogCore(message, true); }
 
 } // namespace streebog512impl
 
 static std::string streebog512Hex(const std::string& input) {
     return toHex(streebog512impl::streebog512(input));
+}
+static std::string streebog256Hex(const std::string& input) {
+    return toHex(streebog512impl::streebog256(input));
 }
 
 // ============================================================
@@ -1121,6 +1225,267 @@ static bool completeUserSetup(const std::string& username, const std::string& em
 }
 
 // ============================================================
+// Криптографические примитивы для шифрования сообщений
+// ============================================================
+static bool hexDecode(const std::string& hex, std::vector<uint8_t>& out) {
+    out.clear();
+    if (hex.size() % 2 != 0) return false;
+    out.reserve(hex.size() / 2);
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        int hi = nib(hex[i]), lo = nib(hex[i + 1]);
+        if (hi < 0 || lo < 0) { out.clear(); return false; }
+        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return true;
+}
+
+static void secureWipe(void* p, size_t n) {
+    volatile uint8_t* v = static_cast<volatile uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) v[i] = 0;
+}
+static void secureWipe(std::string& s) { if (!s.empty()) secureWipe(&s[0], s.size()); s.clear(); }
+static void secureWipe(std::vector<uint8_t>& v) { if (!v.empty()) secureWipe(v.data(), v.size()); v.clear(); }
+
+// Стрибог-512 над произвольными байтами (для HMAC, PBKDF2, OAEP/MGF1)
+static std::vector<uint8_t> streebog512Bytes(const uint8_t* data, size_t len) {
+    std::string s;
+    if (len) s.assign(reinterpret_cast<const char*>(data), len);
+    return streebog512impl::streebog512(s);
+}
+
+static std::vector<uint8_t> streebog256Bytes(const uint8_t* data, size_t len) {
+    std::string s;
+    if (len) s.assign(reinterpret_cast<const char*>(data), len);
+    return streebog512impl::streebog256(s);
+}
+
+// HMAC на основе Стрибога (Р 50.1.113-2016: HMAC_GOSTR3411_2012_256 / _512).
+// Размер блока у обоих вариантов — 64 байта.
+constexpr int HMAC_LINE = __LINE__ + 1;
+static std::vector<uint8_t> hmacStreebog(const std::vector<uint8_t>& key, const uint8_t* msg, size_t len,
+                                         bool variant256) {
+    const size_t B = 64;
+    auto H = variant256 ? streebog256Bytes : streebog512Bytes;
+    const size_t L = variant256 ? 32 : 64;
+    std::vector<uint8_t> k = key.size() > B ? H(key.data(), key.size()) : key;
+    k.resize(B, 0x00);
+    std::vector<uint8_t> inner(B + len), outer(B + L);
+    for (size_t i = 0; i < B; i++) { inner[i] = k[i] ^ 0x36; outer[i] = k[i] ^ 0x5c; }
+    if (len) std::memcpy(inner.data() + B, msg, len);
+    std::vector<uint8_t> ih = H(inner.data(), inner.size());
+    std::memcpy(outer.data() + B, ih.data(), L);
+    std::vector<uint8_t> res = H(outer.data(), outer.size());
+    secureWipe(k); secureWipe(inner); secureWipe(outer);
+    return res;
+}
+static std::vector<uint8_t> hmacStreebog512(const std::vector<uint8_t>& key, const uint8_t* msg, size_t len) {
+    return hmacStreebog(key, msg, len, false);
+}
+
+// PBKDF2 (RFC 8018) с HMAC-Стрибог-512 — по Р 50.1.111-2016.
+// Делает подбор пароля по украденному хранилищу дорогим: каждая
+// попытка стоит PBKDF2_ITERATIONS вычислений HMAC.
+static const uint32_t PBKDF2_ITERATIONS = 20000;
+
+static std::vector<uint8_t> pbkdf2Streebog512(const std::string& password, const std::vector<uint8_t>& salt,
+                                              uint32_t iterations, size_t dkLen) {
+    std::vector<uint8_t> pw(password.begin(), password.end());
+    std::vector<uint8_t> dk;
+    for (uint32_t block = 1; dk.size() < dkLen; block++) {
+        std::vector<uint8_t> s = salt;
+        s.push_back(static_cast<uint8_t>(block >> 24)); s.push_back(static_cast<uint8_t>(block >> 16));
+        s.push_back(static_cast<uint8_t>(block >> 8));  s.push_back(static_cast<uint8_t>(block));
+        std::vector<uint8_t> u = hmacStreebog512(pw, s.data(), s.size());
+        std::vector<uint8_t> t = u;
+        for (uint32_t i = 1; i < iterations; i++) {
+            u = hmacStreebog512(pw, u.data(), u.size());
+            for (size_t j = 0; j < t.size(); j++) t[j] ^= u[j];
+        }
+        dk.insert(dk.end(), t.begin(), t.end());
+    }
+    dk.resize(dkLen);
+    secureWipe(pw);
+    return dk;
+}
+
+// ------------------------------------------------------------
+// «Запечатывание» данных: Кузнечик-CTR + имитовставка OMAC
+// (Encrypt-then-MAC, отдельные ключи шифрования и имитозащиты).
+// Ключ — 64 байта: [0..32) шифрование, [32..64) имитовставка.
+// Формат: iv_hex:ciphertext_hex:mac_hex
+// ------------------------------------------------------------
+struct SealedData {
+    std::vector<uint8_t> iv, ct, mac;
+};
+
+static SealedData kuzSeal(const std::vector<uint8_t>& key64, const std::string& plaintext) {
+    SealedData s;
+    s.iv = securerand::bytes(8);
+    kuz::Cipher enc(key64.data());
+    kuz::Cipher macC(key64.data() + 32);
+    s.ct = kuz::ctrXcrypt(enc, s.iv.data(), reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size());
+    std::vector<uint8_t> authData = s.iv;
+    authData.insert(authData.end(), s.ct.begin(), s.ct.end());
+    auto m = kuz::omac(macC, authData.data(), authData.size());
+    s.mac.assign(m.begin(), m.end());
+    return s;
+}
+
+static bool kuzOpen(const std::vector<uint8_t>& key64, const SealedData& s, std::string& plaintext) {
+    plaintext.clear();
+    if (s.iv.size() != 8 || s.mac.size() != 16) return false;
+    kuz::Cipher enc(key64.data());
+    kuz::Cipher macC(key64.data() + 32);
+    std::vector<uint8_t> authData = s.iv;
+    authData.insert(authData.end(), s.ct.begin(), s.ct.end());
+    auto m = kuz::omac(macC, authData.data(), authData.size());
+    if (!kuz::constTimeEq(m.data(), s.mac.data(), 16)) return false;   // сначала проверка целостности
+    auto pt = kuz::ctrXcrypt(enc, s.iv.data(), s.ct.data(), s.ct.size());
+    plaintext.assign(pt.begin(), pt.end());
+    secureWipe(pt);
+    return true;
+}
+
+static std::string sealedToString(const SealedData& s) {
+    return toHex(s.iv) + ":" + toHex(s.ct) + ":" + toHex(s.mac);
+}
+
+static bool sealedFromString(const std::string& str, SealedData& s) {
+    size_t a = str.find(':');
+    size_t b = (a == std::string::npos) ? std::string::npos : str.find(':', a + 1);
+    if (b == std::string::npos) return false;
+    return hexDecode(str.substr(0, a), s.iv) && hexDecode(str.substr(a + 1, b - a - 1), s.ct) &&
+           hexDecode(str.substr(b + 1), s.mac);
+}
+
+// Обёртки для модуля RSA
+static rsa::HashFn streebogHashFn() { return [](const uint8_t* d, size_t n) { return streebog512Bytes(d, n); }; }
+static rsa::RandomFn cspRandomFn() { return [](uint8_t* b, size_t n) { securerand::fill(b, n); }; }
+static const size_t RSA_MODULUS_BITS = 32768;
+// Число простых в модуле RSA. 4 — многопростой RSA (RFC 8017): тот же
+// 32768-битный модуль, но ключ генерируется в ~3-4 раза быстрее, а
+// расшифровывается в ~4-7 раз быстрее. Поставьте 2 для классического RSA (n = p*q).
+static const size_t RSA_PRIMES = 4;
+static const size_t STREEBOG_LEN = 64;
+
+// ============================================================
+// Хранилище пользователя (vault/<hex(логин)>/)
+// ============================================================
+// keys.txt — строки key=value:
+//   kdf_salt, kdf_iter   — параметры PBKDF2 для ключа из пароля (KEK)
+//   msg_key              — случайный 512-битный ключ сообщений «Кузнечика»,
+//                          запечатанный на KEK
+//   rsa_n, rsa_e         — открытый ключ RSA-32768
+//   rsa_priv             — закрытый ключ (p:q:d:dp:dq:qinv), запечатанный на KEK
+//   rsa_created, rsa_gen_seconds — когда и за сколько сгенерирован ключ
+// messages.txt — строки id;unix_time;алгоритм;данные
+//   KUZ: iv:шифртекст:имитовставка (hex)
+//   RSA: блок1:блок2:... (hex, по 4096 байт)
+//
+// Секреты на диске хранятся только в зашифрованном виде. Ключ к ним
+// выводится из пароля, который знает только пользователь, поэтому без
+// пароля (даже имея все файлы) прочитать сообщения нельзя.
+const std::string VAULT_DIR = "vault";
+
+static std::string vaultDirFor(const std::string& username) {
+    return VAULT_DIR + "/" + toHex(std::vector<uint8_t>(username.begin(), username.end()));
+}
+static std::string vaultKeysFile(const std::string& u) { return vaultDirFor(u) + "/keys.txt"; }
+static std::string vaultMessagesFile(const std::string& u) { return vaultDirFor(u) + "/messages.txt"; }
+
+static bool vaultExists(const std::string& username) {
+    std::error_code ec;
+    return std::filesystem::exists(vaultKeysFile(username), ec);
+}
+
+static void deleteVault(const std::string& username) {
+    std::error_code ec;
+    std::filesystem::remove_all(vaultDirFor(username), ec);
+}
+
+static void restrictToOwner(const std::string& path, bool isDir) {
+    std::error_code ec;
+    auto perms = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    if (isDir) perms |= std::filesystem::perms::owner_exec;
+    std::filesystem::permissions(path, perms, std::filesystem::perm_options::replace, ec);
+}
+
+static std::map<std::string, std::string> loadKeyValueFile(const std::string& path) {
+    std::map<std::string, std::string> kv;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        kv[line.substr(0, eq)] = line.substr(eq + 1);
+    }
+    return kv;
+}
+
+// Атомарная запись: пишем во временный файл и переименовываем —
+// при сбое посреди записи старый файл ключей не будет испорчен.
+static bool saveKeyValueFile(const std::string& path, const std::map<std::string, std::string>& kv) {
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out.is_open()) return false;
+        for (const auto& p : kv) out << p.first << '=' << p.second << '\n';
+        if (!out) return false;
+    }
+    restrictToOwner(tmp, false);
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    return !ec;
+}
+
+struct StoredMessage {
+    uint64_t id = 0;
+    uint64_t created = 0;
+    std::string algo;      // "KUZ" или "RSA"
+    std::string payload;
+    double encSec = -1;    // время шифрования, с (-1 — неизвестно: сообщение старого формата)
+};
+
+static std::vector<StoredMessage> loadMessages(const std::string& username) {
+    std::vector<StoredMessage> res;
+    std::ifstream in(vaultMessagesFile(username));
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        auto f = splitByDelimiter(line, ';');
+        if (f.size() != 4 && f.size() != 5) continue;
+        StoredMessage m;
+        try {
+            m.id = std::stoull(f[0]);
+            m.created = std::stoull(f[1]);
+            if (f.size() == 5) m.encSec = std::stod(f[4]) / 1e6;   // хранится в микросекундах
+        } catch (...) { continue; }
+        m.algo = f[2];
+        m.payload = f[3];
+        res.push_back(std::move(m));
+    }
+    return res;
+}
+
+static bool appendMessage(const std::string& username, const StoredMessage& m) {
+    std::string path = vaultMessagesFile(username);
+    std::ofstream out(path, std::ios::app);
+    if (!out.is_open()) return false;
+    out << m.id << ';' << m.created << ';' << m.algo << ';' << m.payload;
+    if (m.encSec >= 0) out << ';' << static_cast<long long>(m.encSec * 1e6 + 0.5);
+    out << '\n';
+    out.close();
+    restrictToOwner(path, false);
+    return true;
+}
+
+// ============================================================
 // Регистрация
 // ============================================================
 static void registerUser() {
@@ -1250,6 +1615,7 @@ static void runAdminPanel() {
                 std::cout << "Пользователь не найден.\n";
                 continue;
             }
+            deleteVault(delUsername);   // вместе с учёткой удаляем её ключи и сообщения
             std::cout << "Учётная запись \"" << delUsername << "\" удалена.\n";
         } else if (choice == "4") {
             std::cout << "Выход из панели администратора.\n";
@@ -1296,6 +1662,1549 @@ static bool completeFirstLoginSetup(const std::string& username) {
               << "  " << otpauthUri << "\n\n"
               << "Продолжаем вход...\n\n";
     return true;
+}
+
+// ============================================================
+// Проверка реализации по контрольным примерам ГОСТ
+// ============================================================
+// Значения взяты из текстов стандартов:
+//   ГОСТ Р 34.11-2012 (Стрибог), прил. А — примеры 1 и 2 для 512 и 256 бит;
+//   ГОСТ Р 34.12-2015 (Кузнечик), прил. А.1 — промежуточные значения
+//     преобразований S, R, L, итерационные константы C_i, развёртка ключа
+//     K_1..K_10, зашифрование и расшифрование блока;
+//   ГОСТ Р 34.13-2015, прил. А.1 — режимы простой замены (ECB),
+//     гаммирования (CTR) и выработки имитовставки (MAC);
+//   Р 50.1.113-2016 — HMAC на Стрибоге-256/512.
+// В ГОСТ Р 34.11-2012 числа записаны старшим байтом вперёд, а программа
+// хранит байты в порядке следования в памяти, поэтому для Стрибога
+// сравнивается развёрнутая запись — ровно в том виде, как в стандарте.
+// Эти проверки выполняются при каждом запуске программы (самотестирование
+// криптомодуля); при расхождении работа прекращается.
+static std::string findFontPath(bool mono);   // определены ниже
+static pdfsig::HashFn streebog256HashFn();
+
+struct KatResult {
+    std::string algo, name, source, expected, got;
+    std::vector<std::string> params;   // какие константы ГОСТ участвуют и где они заданы в программе
+    std::string input;                 // входные данные из приложения к стандарту
+    std::string note;                  // пояснение (например, про порядок байтов)
+    bool ok() const { return expected == got; }
+};
+
+static std::string reverseHex(const std::string& hex) {
+    std::string r;
+    for (size_t i = hex.size(); i >= 2; i -= 2) r += hex.substr(i - 2, 2);
+    return r;
+}
+
+static std::vector<uint8_t> hexBytes(const std::string& hex) {
+    std::vector<uint8_t> v;
+    hexDecode(hex, v);
+    return v;
+}
+
+static std::string blockHex(const kuz::Block& b) { return toHex(std::vector<uint8_t>(b.begin(), b.end())); }
+
+static std::string where(const char* file, int line, const std::string& what) {
+    return std::string(file) + ", строка " + std::to_string(line) + " (" + what + ")";
+}
+
+// ---- описания параметров ГОСТ и мест, где они заданы в программе ----
+static std::vector<std::string> streebogParams(bool v256) {
+    return {
+        "π - нелинейная биекция, 256 байт: " + where("auth3fa.cpp", streebog512impl::PI_LINE, "массив Pi"),
+        "τ - перестановка байтов: " + where("auth3fa.cpp", streebog512impl::TAU_LINE, "функция makeTauEntry"),
+        "A - матрица линейного преобразования l, 64 строки по 64 бита: " +
+            where("auth3fa.cpp", streebog512impl::A_LINE, "массив A[64]") + "; ускоряющая таблица строится из неё: " +
+            where("auth3fa.cpp", streebog512impl::LTABLE_LINE, "структура LTable"),
+        "C1..C12 - итерационные константы по 512 бит: " + where("auth3fa.cpp", streebog512impl::C_LINE, "массив C_qwords[12][8]"),
+        std::string("IV = ") + (v256 ? "(00000001)^64 для варианта 256 бит" : "0^512 для варианта 512 бит") + ": " +
+            where("auth3fa.cpp", streebog512impl::CORE_LINE, "функция streebogCore"),
+    };
+}
+static std::vector<std::string> hmacParams(bool v256) {
+    auto p = streebogParams(v256);
+    p.push_back("ipad = 0x36, opad = 0x5c, блок 64 байта: " + where("auth3fa.cpp", HMAC_LINE, "функция hmacStreebog"));
+    return p;
+}
+static std::string kuzPiParam() { return "π - нелинейная биекция, 256 байт: " + where("kuznyechik.hpp", kuz::PI_LINE, "массив kuz::PI"); }
+static std::string kuzLcParam() {
+    return "коэффициенты линейного преобразования l (148, 32, 133, 16, 194, 192, 1, 251, 1, 192, 194, 16, 133, 32, 148, 1): " +
+           where("kuznyechik.hpp", kuz::LC_LINE, "массив kuz::LC");
+}
+static std::string kuzFieldParam() {
+    return "поле GF(2^8), p(x) = x^8 + x^7 + x^6 + x + 1: " + where("kuznyechik.hpp", kuz::GFMUL_LINE, "функция kuz::gfMul");
+}
+static std::string kuzKeyParam() {
+    return "развёртка ключа, C_i = L(Vec128(i)), 32 раунда сети Фейстеля: " +
+           where("kuznyechik.hpp", kuz::Cipher::EXPANDKEY_LINE, "метод Cipher::expandKey");
+}
+static std::string kuzTablesParam() {
+    return "таблицы LS 16x256 (строятся при запуске из π и l): " + where("kuznyechik.hpp", kuz::TABLES_LINE, "структура kuz::Tables");
+}
+static std::vector<std::string> kuzCipherParams() {
+    return {kuzPiParam(), kuzLcParam(), kuzFieldParam(), kuzKeyParam(), kuzTablesParam()};
+}
+
+static std::vector<KatResult> gostKats() {
+    std::vector<KatResult> r;
+
+    // ---------- ГОСТ Р 34.11-2012 ----------
+    const std::string src34112 = "ГОСТ Р 34.11-2012, прил. А";
+    const std::string beNote = "в ГОСТ Р 34.11-2012 числа записаны старшим байтом вперёд; результат программы "
+                               "переведён в эту же запись";
+    const std::string M1 = "012345678901234567890123456789012345678901234567890123456789012";
+    const std::string m1Gost = reverseHex(toHex(std::vector<uint8_t>(M1.begin(), M1.end())));
+    const std::string m2Gost = "fbe2e5f0eee3c820fbeafaebef20fffbf0e1e0f0f520e0ed20e8ece0ebe5f0f2f120fff0eeec20f120faf2fee5"
+                               "e2202ce8f6f3ede220e8e6eee1e8f0f2d1202ce8f0f2e5e220e5d1";
+    const auto m2b = hexBytes(reverseHex(m2Gost));   // в памяти — обратный порядок
+    const std::string M2(m2b.begin(), m2b.end());
+    const std::string in1 = "M1 = " + m1Gost + " (63 байта: строка \"" + M1 + "\")";
+    const std::string in2 = "M2 = " + m2Gost + " (72 байта в CP1251: \"Се ветри, Стрибожи внуци, веютъ с моря "
+                            "стрелами на храбрыя плъкы Игоревы\")";
+    r.push_back({"Стрибог-512", "Пример 1", src34112,
+        "486f64c1917879417fef082b3381a4e211c324f074654c38823a7b76f830ad00"
+        "fa1fbae42b1285c0352f227524bc9ab16254288dd6863dccd5b9f54a1ad0541b",
+        reverseHex(streebog512Hex(M1)), streebogParams(false), in1, beNote});
+    r.push_back({"Стрибог-512", "Пример 2", src34112,
+        "28fbc9bada033b1460642bdcddb90c3fb3e56c497ccd0f62b8a2ad4935e85f03"
+        "7613966de4ee00531ae60f3b5a47f8dae06915d5f2f194996fcabf2622e6881e",
+        reverseHex(streebog512Hex(M2)), streebogParams(false), in2, beNote});
+    r.push_back({"Стрибог-256", "Пример 1", src34112,
+        "00557be5e584fd52a449b16b0251d05d27f94ab76cbaa6da890b59d8ef1e159d",
+        reverseHex(streebog256Hex(M1)), streebogParams(true), in1, beNote});
+    r.push_back({"Стрибог-256", "Пример 2", src34112,
+        "508f7e553c06501d749a66fc28c6cac0b005746d97537fa85d9e40904efed29d",
+        reverseHex(streebog256Hex(M2)), streebogParams(true), in2, beNote});
+
+    // ---------- Р 50.1.113-2016: HMAC ----------
+    const std::string hkHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const std::string hmHex = "0126bdb87800af214341456563780100";
+    const auto hk = hexBytes(hkHex), hm = hexBytes(hmHex);
+    const std::string hin = "ключ K = " + hkHex + "\nданные T = " + hmHex;
+    r.push_back({"HMAC-Стрибог-256", "HMAC_GOSTR3411_2012_256", "Р 50.1.113-2016",
+        "a1aa5f7de402d7b3d323f2991c8d4534013137010a83754fd0af6d7cd4922ed9",
+        toHex(hmacStreebog(hk, hm.data(), hm.size(), true)), hmacParams(true), hin, ""});
+    r.push_back({"HMAC-Стрибог-512", "HMAC_GOSTR3411_2012_512", "Р 50.1.113-2016",
+        "a59bab22ecae19c65fbde6e5f4e9f5d8549d31f037f9df9b905500e171923a77"
+        "3d5f1530f2ed7e964cb2eedc29e9ad2f3afe93b2814f79f5000ffc0366c251e6",
+        toHex(hmacStreebog(hk, hm.data(), hm.size(), false)), hmacParams(false), hin, ""});
+
+    // ---------- ГОСТ Р 34.12-2015: преобразования ----------
+    const std::string src3412 = "ГОСТ Р 34.12-2015, прил. А.1";
+    auto blk = [](const std::string& h) { kuz::Block b{}; auto v = hexBytes(h); std::copy(v.begin(), v.end(), b.begin()); return b; };
+    auto opS = [](kuz::Block b) { for (auto& x : b) x = kuz::PI[x]; return b; };
+
+    const char* sExp[4] = {"b66cd8887d38e8d77765aeea0c9a7efc", "559d8dd7bd06cbfe7e7b262523280d39",
+                           "0c3322fed531e4630d80ef5c5a81c50b", "23ae65633f842d29c5df529c13f5acda"};
+    kuz::Block s = blk("ffeeddccbbaa99881122334455667700");
+    for (int i = 0; i < 4; i++) {
+        std::string in = "S(" + blockHex(s) + ")";
+        s = opS(s);
+        r.push_back({"Кузнечик", "Преобразование S, шаг " + std::to_string(i + 1), src3412, sExp[i], blockHex(s),
+                     {kuzPiParam()}, in, ""});
+    }
+    const char* rExp[4] = {"94000000000000000000000000000001", "a5940000000000000000000000000000",
+                           "64a59400000000000000000000000000", "0d64a594000000000000000000000000"};
+    kuz::Block rr = blk("00000000000000000000000000000100");
+    for (int i = 0; i < 4; i++) {
+        std::string in = "R(" + blockHex(rr) + ")";
+        rr = kuz::opR(rr);
+        r.push_back({"Кузнечик", "Преобразование R, шаг " + std::to_string(i + 1), src3412, rExp[i], blockHex(rr),
+                     {kuzLcParam(), kuzFieldParam()}, in, ""});
+    }
+    const char* lExp[4] = {"d456584dd0e3e84cc3166e4b7fa2890d", "79d26221b87b584cd42fbc4ffea5de9a",
+                           "0e93691a0cfc60408b7b68f66b513c13", "e6a8094fee0aa204fd97bcb0b44b8580"};
+    kuz::Block ll = blk("64a59400000000000000000000000000");
+    for (int i = 0; i < 4; i++) {
+        std::string in = "L(" + blockHex(ll) + "), L = R^16";
+        ll = kuz::opL(ll);
+        r.push_back({"Кузнечик", "Преобразование L, шаг " + std::to_string(i + 1), src3412, lExp[i], blockHex(ll),
+                     {kuzLcParam(), kuzFieldParam()}, in, ""});
+    }
+    const char* cExp[4] = {"6ea276726c487ab85d27bd10dd849401", "dc87ece4d890f4b3ba4eb92079cbeb02",
+                           "b2259a96b4d88e0be7690430a44f7f03", "7bcd1b0b73e32ba5b79cb140f2551504"};
+    for (int i = 0; i < 4; i++) {
+        kuz::Block c{};
+        c[15] = static_cast<uint8_t>(i + 1);
+        r.push_back({"Кузнечик", "Константа C" + std::to_string(i + 1), src3412, cExp[i], blockHex(kuz::opL(c)),
+                     {kuzLcParam(), kuzFieldParam(), kuzKeyParam()}, "C" + std::to_string(i + 1) + " = L(" + blockHex(c) + ")", ""});
+    }
+
+    // ---------- развёртка ключа и блок ----------
+    const std::string keyHex = "8899aabbccddeeff0011223344556677fedcba98765432100123456789abcdef";
+    const auto key = hexBytes(keyHex);
+    kuz::Cipher cipher(key.data());
+    const std::string kin = "ключ K = " + keyHex;
+    const char* kExp[10] = {
+        "8899aabbccddeeff0011223344556677", "fedcba98765432100123456789abcdef",
+        "db31485315694343228d6aef8cc78c44", "3d4553d8e9cfec6815ebadc40a9ffd04",
+        "57646468c44a5e28d3e59246f429f1ac", "bd079435165c6432b532e82834da581b",
+        "51e640757e8745de705727265a0098b1", "5a7925017b9fdd3ed72a91a22286f984",
+        "bb44e25378c73123a5f32f73cdb6e517", "72e9dd7416bcf45b755dbaa88e4a4043"};
+    for (int i = 0; i < 10; i++)
+        r.push_back({"Кузнечик", "Раундовый ключ K" + std::to_string(i + 1), src3412, kExp[i], blockHex(cipher.roundKey(i)),
+                     {kuzPiParam(), kuzLcParam(), kuzFieldParam(), kuzKeyParam()}, kin, ""});
+
+    std::vector<uint8_t> out(16), back(16);
+    const std::string p1Hex = "1122334455667700ffeeddccbbaa9988";
+    const auto p1 = hexBytes(p1Hex);
+    cipher.encryptBlock(p1.data(), out.data());
+    cipher.decryptBlock(out.data(), back.data());
+    r.push_back({"Кузнечик", "Зашифрование блока", src3412, "7f679d90bebc24305a468d42b9d4edcd", toHex(out),
+                 kuzCipherParams(), kin + "\nоткрытый текст a = " + p1Hex, ""});
+    r.push_back({"Кузнечик", "Расшифрование блока", src3412, p1Hex, toHex(back),
+                 kuzCipherParams(), kin + "\nшифртекст b = 7f679d90bebc24305a468d42b9d4edcd", ""});
+
+    // ---------- ГОСТ Р 34.13-2015: режимы ----------
+    const std::string src3413 = "ГОСТ Р 34.13-2015, прил. А.1";
+    const std::string ptHex = "1122334455667700ffeeddccbbaa998800112233445566778899aabbcceeff0a"
+                              "112233445566778899aabbcceeff0a002233445566778899aabbcceeff0a0011";
+    const auto pt = hexBytes(ptHex);
+    const char* ecbExp[4] = {"7f679d90bebc24305a468d42b9d4edcd", "b429912c6e0032f9285452d76718d08b",
+                             "f0ca33549d247ceef3f5a5313bd4b157", "d0b09ccde830b9eb3a02c4c5aa8ada98"};
+    for (int i = 0; i < 4; i++) {
+        std::string pi = ptHex.substr(32 * i, 32);
+        cipher.encryptBlock(pt.data() + 16 * i, out.data());
+        cipher.decryptBlock(out.data(), back.data());
+        r.push_back({"Кузнечик-ECB", "Блок " + std::to_string(i + 1) + ", зашифрование", src3413, ecbExp[i], toHex(out),
+                     kuzCipherParams(), kin + "\nP" + std::to_string(i + 1) + " = " + pi, ""});
+        r.push_back({"Кузнечик-ECB", "Блок " + std::to_string(i + 1) + ", расшифрование", src3413, pi, toHex(back),
+                     kuzCipherParams(), kin + "\nC" + std::to_string(i + 1) + " = " + ecbExp[i], ""});
+    }
+    const std::string ivHex = "1234567890abcef0";
+    const auto iv = hexBytes(ivHex);
+    auto ctrParams = kuzCipherParams();
+    ctrParams.push_back("CTR_1 = IV || 0^64, CTR_{i+1} = CTR_i + 1 mod 2^128: " +
+                        where("kuznyechik.hpp", kuz::CTR_LINE, "функция kuz::ctrXcrypt"));
+    auto ctr = kuz::ctrXcrypt(cipher, iv.data(), pt.data(), pt.size());
+    const std::string ctrExp = "f195d8bec10ed1dbd57b5fa240bda1b885eee733f6a13e5df33ce4b33c45dee4"
+                               "a5eae88be6356ed3d5e877f13564a3a5cb91fab1f20cbab6d1c6d15820bdba73";
+    r.push_back({"Кузнечик-CTR", "Гаммирование, 4 блока", src3413, ctrExp, toHex(ctr), ctrParams,
+                 kin + "\nIV = " + ivHex + "\nP = " + ptHex, ""});
+    auto ctrBack = kuz::ctrXcrypt(cipher, iv.data(), ctr.data(), ctr.size());
+    r.push_back({"Кузнечик-CTR", "Обратное гаммирование", src3413, ptHex, toHex(ctrBack), ctrParams,
+                 kin + "\nIV = " + ivHex + "\nC = " + ctrExp, ""});
+    auto macParams = kuzCipherParams();
+    macParams.push_back("B_128 = 0^120 || 10000111 (0x87) для выработки K1, K2: " +
+                        where("kuznyechik.hpp", kuz::OMAC_LINE, "функция kuz::omacShift"));
+    auto mac = kuz::omac(cipher, pt.data(), pt.size());
+    r.push_back({"Кузнечик-MAC", "Имитовставка, s = 64", src3413, "336f4d296059fbe3",
+                 toHex(std::vector<uint8_t>(mac.begin(), mac.begin() + 8)), macParams,
+                 kin + "\nP = " + ptHex, "s = 64: берутся старшие 64 бита имитовставки"});
+
+    // ---------- ГОСТ Р 34.10-2012: контрольный пример 1 ----------
+    const std::string src3410 = "ГОСТ Р 34.10-2012, прил. А, пример 1";
+    const auto& tc = gost3410::testCurve();
+    auto lc = [](const std::string& h) { std::string r = h; for (auto& ch : r) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); return r; };
+    std::vector<std::string> p3410 = {
+        "параметры тестовой кривой p, a, b, q, P = (xP, yP) из примера 1: " +
+            where("gost3410.hpp", gost3410::CURVE_TEST_LINE, "функция testCurve"),
+        "вычисление подписи (шаги 3-5 п. 6.1): " + where("gost3410.hpp", gost3410::SIGN_LINE, "функция signWithK"),
+    };
+    const std::string dHex = "7A929ADE789BB9BE10ED359DD39A72C11B60961F49397EEE1D19CE9891EC3B28";
+    const std::string eHex = "2DFBC1B372D89A1188C09C52E0EEC61FCE52032AB1022E8E67ECE6672B043EE5";
+    const std::string kHex = "77105C9B20BCD3122823C8CF6FCC7B956DE33814E95B7FE64FED924594DCEAB3";
+    gost3410::Mpz d = gost3410::hexMpz(dHex.c_str()), e = gost3410::hexMpz(eHex.c_str()), k = gost3410::hexMpz(kHex.c_str());
+    gost3410::Point Qt = gost3410::publicFromPrivate(tc, d);
+    auto pad64 = [](std::string h) { return std::string(h.size() < 64 ? 64 - h.size() : 0, '0') + h; };
+    std::vector<std::string> pKey = {p3410[0]};
+    r.push_back({"ГОСТ 34.10-2012", "Открытый ключ: xQ", src3410,
+                 "7f2b49e270db6d90d8595bec458b50c58585ba1d4e9b788f6689dbd8e56fd80b", pad64(Qt.x.toHex()), pKey,
+                 "закрытый ключ d = " + lc(dHex) + "\nQ = d*P", ""});
+    r.push_back({"ГОСТ 34.10-2012", "Открытый ключ: yQ", src3410,
+                 "26f1b489d6701dd185c8413a977b3cbbaf64d1c593d26627dffb101a87ff77da", pad64(Qt.y.toHex()), pKey,
+                 "закрытый ключ d = " + lc(dHex) + "\nQ = d*P", ""});
+    gost3410::Signature sg;
+    gost3410::signWithK(tc, d, e, k, sg);
+    const std::string sIn = "d = " + lc(dHex) + "\ne = " + lc(eHex) + "\nk = " + lc(kHex);
+    r.push_back({"ГОСТ 34.10-2012", "Подпись: r = xC mod q", src3410,
+                 "41aa28d2f1ab148280cd9ed56feda41974053554a42767b83ad043fd39dc0493", pad64(sg.r.toHex()), p3410, sIn, ""});
+    r.push_back({"ГОСТ 34.10-2012", "Подпись: s = (r*d + k*e) mod q", src3410,
+                 "01456c64ba4642a1653c235a98a60249bcd6d3f746b631df928014f6c5bf9c40", pad64(sg.s.toHex()), p3410, sIn, ""});
+    std::vector<std::string> pVer = {p3410[0], "проверка подписи (п. 6.2): " +
+                                     where("gost3410.hpp", gost3410::VERIFY_LINE, "функция verifyE")};
+    r.push_back({"ГОСТ 34.10-2012", "Проверка подписи (r, s)", src3410, "подпись верна",
+                 gost3410::verifyE(tc, Qt, e, sg) ? "подпись верна" : "подпись неверна", pVer,
+                 "Q, e из примера, (r, s) - полученные выше", ""});
+    return r;
+}
+
+// Подробный отчёт по каждой проверке: параметры ГОСТ и где они заданы,
+// входные данные из приложения, полученное и ожидаемое значение, итог.
+static void printWrappedHex(const std::string& label, const std::string& hex) {
+    const size_t W = 64;
+    std::string pad(utf8DisplayWidth(label), ' ');
+    for (size_t i = 0; i < hex.size() || i == 0; i += W) {
+        std::cout << (i == 0 ? label : pad) << hex.substr(i, W) << "\n";
+        if (hex.empty()) break;
+    }
+}
+
+static void printKatDetails(const std::vector<KatResult>& results) {
+    for (size_t i = 0; i < results.size(); i++) {
+        const auto& k = results[i];
+        std::cout << "\n[" << (i + 1) << "/" << results.size() << "] " << k.algo << " - " << k.name << "\n"
+                  << "  Эталон взят из: " << k.source << "\n"
+                  << "  Использованы параметры ГОСТ:\n";
+        for (const auto& p : k.params) std::cout << "    - " << p << "\n";
+        std::cout << "  Входные данные из приложения:\n";
+        size_t start = 0;
+        while (true) {
+            size_t nl = k.input.find('\n', start);
+            std::cout << "    " << k.input.substr(start, nl == std::string::npos ? std::string::npos : nl - start) << "\n";
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
+        if (!k.note.empty()) std::cout << "  Примечание: " << k.note << "\n";
+        printWrappedHex("  Получено программой: ", k.got);
+        printWrappedHex("  Ожидается по ГОСТ:   ", k.expected);
+        std::cout << "  Итог: " << (k.ok() ? "СОВПАЛО" : "НЕ СОВПАЛО") << "\n";
+    }
+}
+
+// Дополнительные проверки (не из ГОСТ): границы блоков Стрибога по
+// независимой эталонной реализации, целостность «запечатывания», RSA-OAEP.
+static std::vector<KatResult> extraChecks() {
+    std::vector<KatResult> r;
+    const std::string src = "эталонная реализация";
+    struct Vec { const char* name; std::string input; const char* expected; };
+    const std::vector<Vec> vectors = {
+        {"пустое сообщение", std::string(),
+         "8e945da209aa869f0455928529bcae4679e9873ab707b55315f56ceb98bef0a7362f715528356ee83cda5f2aac4c6ad2ba3a715c1bcd81cb8e9f90bf4c1c1a8a"},
+        {"строка abc", std::string("abc"),
+         "28156e28317da7c98f4fe2bed6b542d0dab85bb224445fcedaf75d46e26d7eb8d5997f3e0915dd6b7f0aab08d9c8beb0d8c64bae2ab8b3c8c6bc53b3bf0db728"},
+        {"'a' x 64 (ровно блок)", std::string(64, 'a'),
+         "613852076ca11156cf7d00f4feef0d5e3198e638f8e20eb02da2f5f7dca5b62dd9fb88e22e825f727ed6f25e4145dc868d0ef41e3e451e34b780e5547ade0d43"},
+        {"'a' x 65", std::string(65, 'a'),
+         "42baf8f1711d47b6de63559743d09f5e11c9a348bea73b8bb3fe11be0ec0f6029856d70b936a00f7414b5f1ebd8e2bdaa74f3a893b90978da9cadcb72ae50338"},
+        {"'a' x 128 (два блока)", std::string(128, 'a'),
+         "24741e27419b5e5796383cc54a915c5a69322c758f4391f48f2f120d832f840a82c4a23528d15612febfd2647ce64a97ba6ead9686617876f2d197087b47280f"},
+        {"'a' x 129", std::string(129, 'a'),
+         "14ae98a06eedc746250d75a7c961ae7b058f5408f7c221df81b229935a3f6c134c704c6b431eb52b5ebcee51ea83d5f894415166c203ba3c740af1c43f610b5a"},
+        {"0xFF x 64", std::string(64, '\xff'),
+         "41629de677d7e8090c3cd70affe3300d1e1cfba2db97945ec37feb4e1375bc02a53f00370b7d715b07f37f93cac844efadbfd1b85f9ddae3de9656c0e95affc7"},
+        {"0x00 x 64", std::string(64, '\0'),
+         "b0fd29ac1b0df441769ff3fdb8dc564df67721d6ac06fb28ceffb7bbaa7948c6c014ac999235b58cb26fb60fb112a145d7b4ade9ae566bf2611402c552d20db7"},
+    };
+    for (const auto& v : vectors)
+        r.push_back({"Стрибог-512", std::string("Граница блока: ") + v.name, src, v.expected, streebog512Hex(v.input), {}, "", ""});
+
+    std::vector<uint8_t> k64 = securerand::bytes(64);
+    SealedData sd = kuzSeal(k64, "Проверка целостности");
+    std::string out;
+    bool okOpen = kuzOpen(k64, sd, out) && out == "Проверка целостности";
+    sd.ct[3] ^= 0x01;
+    bool tamperCaught = !kuzOpen(k64, sd, out);
+    r.push_back({"Кузнечик-CTR+OMAC", "Расшифрование и обнаружение подмены", "свойство схемы", "ok",
+                 (okOpen && tamperCaught) ? "ok" : "fail", {}, "", ""});
+
+    // ГОСТ Р 34.10-2012 на рабочей кривой и подпись PDF
+    const auto& wc = gost3410::workCurve();
+    r.push_back({"ГОСТ 34.10-2012", "Рабочая кривая: P на кривой, q*P = O, p и q простые", "RFC 4357 / Р 50.1.114-2016",
+                 "ok", gost3410::curveSane(wc) ? "ok" : "fail", {}, "", ""});
+    {
+        auto kp = gost3410::generateKey(wc, cspRandomFn());
+        pdfsig::CertInfo ci;
+        ci.commonName = "selftest";
+        ci.notBefore = static_cast<time_t>(nowUnixTime());
+        ci.notAfter = ci.notBefore + 3600;
+        auto cert = pdfsig::buildSelfSignedCert(wc, kp, ci, streebog256HashFn(), cspRandomFn());
+        pdf::Document doc;
+        std::string err, font = findFontPath(false);
+        bool built = !font.empty() && doc.addFont(font, err) >= 0;
+        std::string tmp = "selftest_signed.pdf";
+        bool ok = false, tamper = false, append = false;
+        if (built) {
+            doc.paragraph("Проверка подписи", 12);
+            pdf::Document::SignatureRequest req;
+            req.name = "selftest";
+            req.when = ci.notBefore;
+            req.signer = [&](const std::string& part) {
+                auto dg = streebog256Bytes(reinterpret_cast<const uint8_t*>(part.data()), part.size());
+                return pdfsig::buildCms(wc, kp, cert, dg, ci.notBefore, streebog256HashFn(), cspRandomFn());
+            };
+            doc.setSignature(req);
+            if (doc.save(tmp, err)) {
+                std::ifstream in(tmp, std::ios::binary);
+                std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                ok = pdfsig::verifyPdfBytes(data, streebog256HashFn()).valid();
+                std::string t1 = data;
+                t1[200] ^= 0x01;              // меняем один байт в подписанной части (до /Contents)
+                tamper = !pdfsig::verifyPdfBytes(t1, streebog256HashFn()).valid();
+                append = !pdfsig::verifyPdfBytes(data + "%extra\n", streebog256HashFn()).valid();   // дописали в конец
+            }
+            std::remove(tmp.c_str());
+        }
+        r.push_back({"Подпись PDF", built ? "Подпись, проверка, подмена байта, дописывание в конец" : "Шрифт не найден - пропуск",
+                     "ISO 32000-1, RFC 5652", "ok", (ok && tamper && append) ? "ok" : "fail", {}, "", ""});
+    }
+
+    std::vector<size_t> primeCounts = {2};
+    if (RSA_PRIMES != 2) primeCounts.push_back(RSA_PRIMES);
+    for (size_t u : primeCounts) {
+        rsa::PrivateKey sk = rsa::generateKey(2048, u, cspRandomFn(), nullptr);
+        std::string msg;
+        for (int i = 0; i < 20; i++) msg += "Тест RSA-OAEP " + std::to_string(i) + ". ";
+        auto blocks = rsa::encryptMessage(sk.pub(), streebogHashFn(), STREEBOG_LEN, cspRandomFn(), msg);
+        std::string dec, restored;
+        bool rsaOk = rsa::decryptMessage(sk, streebogHashFn(), STREEBOG_LEN, blocks, dec) && dec == msg;
+        rsa::PrivateKey sk2;
+        bool serOk = sk2.deserializeSecret(sk.serializeSecret(), sk.n, sk.e) &&
+                     rsa::decryptMessage(sk2, streebogHashFn(), STREEBOG_LEN, blocks, restored) && restored == msg;
+        blocks[0][100] ^= 0x01;
+        bool rsaTamper = !rsa::decryptMessage(sk, streebogHashFn(), STREEBOG_LEN, blocks, dec);
+        r.push_back({"RSA-OAEP", "2048 бит, " + std::to_string(u) + " простых: " + std::to_string(blocks.size()) +
+                     " блока, ключ, подмена", "RFC 8017", "ok", (rsaOk && serOk && rsaTamper) ? "ok" : "fail", {}, "", ""});
+    }
+    return r;
+}
+
+static std::string shortHex(const std::string& h) {
+    bool ascii = std::all_of(h.begin(), h.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; });
+    return (ascii && h.size() > 16) ? h.substr(0, 16) + "..." : h;   // текст (не hex) не обрезаем
+}
+
+// Печатает таблицу результатов; возвращает true, если всё совпало
+static bool printKatTable(const std::vector<KatResult>& results) {
+    std::vector<std::vector<std::string>> rows;
+    size_t passed = 0;
+    std::string prevAlgo;
+    for (size_t i = 0; i < results.size(); i++) {
+        const auto& k = results[i];
+        if (!prevAlgo.empty() && k.algo != prevAlgo) rows.push_back({"---"});
+        prevAlgo = k.algo;
+        if (k.ok()) passed++;
+        rows.push_back({std::to_string(i + 1), k.algo, k.name, k.source, shortHex(k.expected), k.ok() ? "OK" : "ОШИБКА"});
+    }
+    printAsciiTable({"№", "Алгоритм", "Проверка", "Источник", "Эталон (начало)", "Итог"}, rows,
+                    {Align::Right, Align::Left, Align::Left, Align::Left, Align::Left, Align::Left});
+    for (size_t i = 0; i < results.size(); i++) {
+        if (results[i].ok()) continue;
+        std::cout << "Расхождение в проверке №" << (i + 1) << " (" << results[i].algo << ", " << results[i].name << "):\n"
+                  << "  эталон:   " << results[i].expected << "\n  получено: " << results[i].got << "\n";
+    }
+    std::cout << "Пройдено " << passed << " из " << results.size() << ".\n";
+    return passed == results.size();
+}
+
+// Самотестирование при запуске: только контрольные примеры ГОСТ (быстро)
+static bool startupSelfTest() {
+    auto results = gostKats();
+    size_t passed = 0;
+    for (const auto& k : results) passed += k.ok();
+    if (passed == results.size()) {
+        std::cout << "Самотестирование по контрольным примерам ГОСТ: " << passed << "/" << results.size() << " OK\n";
+        return true;
+    }
+    std::cout << "\nСАМОТЕСТИРОВАНИЕ НЕ ПРОЙДЕНО — реализация шифров повреждена:\n";
+    printKatTable(results);
+    return false;
+}
+
+// ============================================================
+// Производительность и статистика
+// ============================================================
+using BenchClock = std::chrono::steady_clock;
+static double secondsSince(BenchClock::time_point t) {
+    return std::chrono::duration<double>(BenchClock::now() - t).count();
+}
+
+struct TimingStat { size_t n = 0; double mean = 0, median = 0, min = 0, max = 0, sd = 0; };
+
+static TimingStat summarize(std::vector<double> v) {
+    TimingStat s;
+    s.n = v.size();
+    if (v.empty()) return s;
+    std::sort(v.begin(), v.end());
+    s.min = v.front();
+    s.max = v.back();
+    s.median = v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
+    double sum = 0;
+    for (double x : v) sum += x;
+    s.mean = sum / v.size();
+    double sq = 0;
+    for (double x : v) sq += (x - s.mean) * (x - s.mean);
+    s.sd = v.size() > 1 ? std::sqrt(sq / (v.size() - 1)) : 0;
+    return s;
+}
+
+// Одно измерение = batch вызовов f (время делится на batch, чтобы мерить
+// и наносекундные операции). Повторяем, пока не наберётся minRuns
+// измерений и не пройдёт minSeconds, но не больше maxRuns.
+template <class F>
+static TimingStat measure(F&& f, size_t batch, size_t minRuns, double minSeconds, size_t maxRuns, bool warmup = true) {
+    // Прогрев ~50 мс: прогружает таблицы в кэш и выводит частоту ядра из
+    // режима энергосбережения, иначе первые замеры завышены.
+    if (warmup) {
+        auto w = BenchClock::now();
+        do { f(); } while (secondsSince(w) < 0.05);
+    }
+    std::vector<double> samples;
+    auto start = BenchClock::now();
+    while (samples.size() < maxRuns && (samples.size() < minRuns || secondsSince(start) < minSeconds)) {
+        auto t = BenchClock::now();
+        for (size_t i = 0; i < batch; i++) f();
+        samples.push_back(secondsSince(t) / static_cast<double>(batch));
+    }
+    return summarize(samples);
+}
+
+static std::string fmtNum(double v, int prec) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(prec) << v;
+    return os.str();
+}
+static std::string fmtTime(double sec) {
+    if (sec < 1e-6) return fmtNum(sec * 1e9, 1) + " нс";
+    if (sec < 1e-3) return fmtNum(sec * 1e6, 2) + " мкс";
+    if (sec < 1)    return fmtNum(sec * 1e3, 2) + " мс";
+    return fmtNum(sec, 2) + " с";
+}
+static std::string fmtRate(double bytesPerOp, double secPerOp) {
+    if (secPerOp <= 0) return "-";
+    if (bytesPerOp > 0) {
+        double mbps = bytesPerOp / secPerOp / 1e6;
+        return fmtNum(mbps, mbps < 10 ? 2 : 1) + " МБ/с";
+    }
+    double ops = 1.0 / secPerOp;
+    if (ops >= 1e6) return fmtNum(ops / 1e6, 2) + " млн оп/с";
+    if (ops >= 1e3) return fmtNum(ops / 1e3, 1) + " тыс. оп/с";
+    return fmtNum(ops, 2) + " оп/с";
+}
+static std::string fmtBytes(size_t b) {
+    if (b >= (1u << 20) && b % (1u << 20) == 0) return std::to_string(b >> 20) + " МБ";
+    if (b >= 1024 && b % 1024 == 0) return std::to_string(b >> 10) + " КБ";
+    return std::to_string(b) + " Б";
+}
+
+struct BenchRow {
+    std::string op, data;
+    TimingStat t;
+    double bytes;   // байт за операцию (0 — выводим операции в секунду)
+};
+
+static void printBenchTable(const std::string& title, const std::vector<BenchRow>& rows) {
+    std::cout << "\n" << title << "\n";
+    std::vector<std::vector<std::string>> cells;
+    for (const auto& r : rows) {
+        double cv = r.t.mean > 0 ? r.t.sd / r.t.mean * 100.0 : 0;
+        cells.push_back({r.op, r.data, std::to_string(r.t.n), fmtTime(r.t.mean), fmtTime(r.t.median),
+                         fmtTime(r.t.min), fmtTime(r.t.max), fmtNum(cv, 1) + "%", fmtRate(r.bytes, r.t.median)});
+    }
+    printAsciiTable({"Операция", "Данные", "N", "Среднее", "Медиана", "Мин", "Макс", "σ/ср.", "Скорость (по медиане)"},
+                    cells, {Align::Left, Align::Right, Align::Right, Align::Right, Align::Right, Align::Right,
+                            Align::Right, Align::Right, Align::Right});
+}
+
+static volatile uint8_t g_benchSink = 0;   // не даёт компилятору выбросить вычисления
+
+static void benchStreebog() {
+    std::string m64(64, 'a'), m1k(1024, 'b'), m1m(1u << 20, 'c');
+    std::vector<BenchRow> rows;
+    rows.push_back({"Стрибог-512", fmtBytes(64),
+        measure([&] { g_benchSink ^= streebog512impl::streebog512(m64)[0]; }, 200, 20, 0.3, 1000), 64});
+    rows.push_back({"Стрибог-512", fmtBytes(1024),
+        measure([&] { g_benchSink ^= streebog512impl::streebog512(m1k)[0]; }, 20, 20, 0.3, 1000), 1024});
+    rows.push_back({"Стрибог-512", fmtBytes(1u << 20),
+        measure([&] { g_benchSink ^= streebog512impl::streebog512(m1m)[0]; }, 1, 5, 1.0, 30), double(1u << 20)});
+    rows.push_back({"Стрибог-256", fmtBytes(64),
+        measure([&] { g_benchSink ^= streebog512impl::streebog256(m64)[0]; }, 200, 20, 0.3, 1000), 64});
+    rows.push_back({"Стрибог-256", fmtBytes(1u << 20),
+        measure([&] { g_benchSink ^= streebog512impl::streebog256(m1m)[0]; }, 1, 5, 1.0, 30), double(1u << 20)});
+    std::vector<uint8_t> hkey(32, 0x42);
+    rows.push_back({"HMAC-Стрибог-512", fmtBytes(64),
+        measure([&] { g_benchSink ^= hmacStreebog512(hkey, reinterpret_cast<const uint8_t*>(m64.data()), 64)[0]; },
+                100, 20, 0.3, 1000), 64});
+    std::vector<uint8_t> salt(16, 0x07);
+    rows.push_back({"PBKDF2-HMAC-Стрибог-512", std::to_string(PBKDF2_ITERATIONS) + " итер.",
+        measure([&] { g_benchSink ^= pbkdf2Streebog512("password", salt, PBKDF2_ITERATIONS, 64)[0]; }, 1, 3, 0, 3), 0});
+    printBenchTable("Стрибог (ГОСТ Р 34.11-2012), таблица L: 8x256 слов", rows);
+}
+
+static void benchKuznyechik() {
+    auto key = securerand::bytes(32);
+    kuz::Cipher c(key.data());
+    std::vector<uint8_t> blockIn(16, 0x5a), blockOut(16);
+    std::vector<uint8_t> mb(1u << 20, 0x33), kb(1024, 0x44);
+    uint8_t iv[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<uint8_t> k64 = securerand::bytes(64);
+    std::string kbStr(1024, 'x');
+    std::vector<BenchRow> rows;
+    rows.push_back({"Развёртка ключа", fmtBytes(32),
+        measure([&] { kuz::Cipher t(key.data()); uint8_t o[16]; t.encryptBlock(blockIn.data(), o); g_benchSink ^= o[0]; },
+                100, 20, 0.3, 1000), 0});
+    rows.push_back({"Зашифрование блока", fmtBytes(16),
+        measure([&] { c.encryptBlock(blockIn.data(), blockOut.data()); blockIn[0] ^= blockOut[0]; }, 100000, 20, 0.3, 1000), 16});
+    rows.push_back({"Расшифрование блока (эталонное)", fmtBytes(16),
+        measure([&] { c.decryptBlock(blockIn.data(), blockOut.data()); blockIn[0] ^= blockOut[0]; }, 1000, 20, 0.3, 1000), 16});
+    rows.push_back({"CTR (гаммирование)", fmtBytes(1u << 20),
+        measure([&] { g_benchSink ^= kuz::ctrXcrypt(c, iv, mb.data(), mb.size())[7]; }, 1, 10, 0.5, 200), double(1u << 20)});
+    rows.push_back({"OMAC (имитовставка)", fmtBytes(1u << 20),
+        measure([&] { g_benchSink ^= kuz::omac(c, mb.data(), mb.size())[0]; }, 1, 10, 0.5, 200), double(1u << 20)});
+    rows.push_back({"CTR + OMAC (сообщение)", fmtBytes(1024),
+        measure([&] { g_benchSink ^= kuzSeal(k64, kbStr).mac[0]; }, 50, 20, 0.3, 1000), 1024});
+    printBenchTable("Кузнечик (ГОСТ Р 34.12-2015 / 34.13-2015), таблицы LS: 16x256x128 бит = 64 КБ", rows);
+}
+
+// ---- статистика генерации ключа RSA (хранится в keys.txt) ----
+static std::string serializeKeygenStats(const rsa::KeygenStats& ks) {
+    std::ostringstream os;
+    os << ks.threads << '|' << ks.sievePrimes << '|' << ks.restarts << '|' << fmtNum(ks.seconds, 3);
+    for (const auto& p : ks.primes)
+        os << '|' << p.bits << ',' << p.windows << ',' << p.sieveCandidates << ',' << p.sieveSurvivors << ','
+           << p.fermatTests << ',' << p.strongTests << ',' << fmtNum(p.sieveSeconds, 3) << ',' << fmtNum(p.seconds, 3) << ',' << p.pseudoprimes;
+    return os.str();
+}
+
+static bool parseKeygenStats(const std::string& s, rsa::KeygenStats& ks) {
+    auto parts = splitByDelimiter(s, '|');
+    if (parts.size() < 5) return false;
+    try {
+        ks.threads = static_cast<unsigned>(std::stoul(parts[0]));
+        ks.sievePrimes = std::stoull(parts[1]);
+        ks.restarts = std::stoull(parts[2]);
+        ks.seconds = std::stod(parts[3]);
+        ks.primes.clear();
+        for (size_t i = 4; i < parts.size(); i++) {
+            auto f = splitByDelimiter(parts[i], ',');
+            if (f.size() != 8 && f.size() != 9) return false;
+            rsa::PrimeStats p;
+            p.bits = std::stoull(f[0]); p.windows = std::stoull(f[1]); p.sieveCandidates = std::stoull(f[2]);
+            p.sieveSurvivors = std::stoull(f[3]); p.fermatTests = std::stoull(f[4]); p.strongTests = std::stoull(f[5]);
+            p.sieveSeconds = std::stod(f[6]); p.seconds = std::stod(f[7]);
+            p.pseudoprimes = f.size() == 9 ? std::stoull(f[8]) : 0;
+            if (f.size() == 8) ks.pseudoKnown = false;
+            ks.primes.push_back(p);
+        }
+    } catch (...) { return false; }
+    return true;
+}
+
+static std::vector<std::string> keygenStatsTable(const rsa::KeygenStats& ks) {
+    std::vector<std::vector<std::string>> rows;
+    size_t totFermat = 0, totStrong = 0, totSurv = 0, totCand = 0;
+    for (size_t i = 0; i < ks.primes.size(); i++) {
+        const auto& p = ks.primes[i];
+        double sieved = p.sieveCandidates ? 100.0 * (1.0 - double(p.sieveSurvivors) / p.sieveCandidates) : 0;
+        rows.push_back({std::to_string(i + 1), std::to_string(p.bits), std::to_string(p.windows),
+                        std::to_string(p.sieveSurvivors) + " / " + std::to_string(p.sieveCandidates),
+                        fmtNum(sieved, 1) + "%", std::to_string(p.fermatTests), std::to_string(p.strongTests),
+                        fmtTime(p.sieveSeconds), fmtTime(p.seconds),
+                        p.fermatTests ? fmtTime(p.seconds / p.fermatTests) : "-"});
+        totFermat += p.fermatTests; totStrong += p.strongTests; totSurv += p.sieveSurvivors; totCand += p.sieveCandidates;
+    }
+    rows.push_back({"---"});
+    rows.push_back({"Итого", "", "", std::to_string(totSurv) + " / " + std::to_string(totCand), "",
+                    std::to_string(totFermat), std::to_string(totStrong), "", fmtTime(ks.seconds), ""});
+    return asciiTable({"Простое", "Бит", "Окон", "Прошли решето", "Отсеяно", "Тестов Ферма", "BPSW+MR",
+                       "Решето", "Время", "На тест"}, rows,
+                      {Align::Right, Align::Right, Align::Right, Align::Right, Align::Right, Align::Right,
+                       Align::Right, Align::Right, Align::Right, Align::Right});
+}
+
+static void printKeygenStats(const rsa::KeygenStats& ks) {
+    std::cout << "\nГенерация ключа RSA-" << RSA_MODULUS_BITS << ": статистика поиска простых\n";
+    for (const auto& l : keygenStatsTable(ks)) std::cout << l << "\n";
+    size_t totFermat = 0, totStrong = 0, totPseudo = 0;
+    for (const auto& p : ks.primes) { totFermat += p.fermatTests; totStrong += p.strongTests; totPseudo += p.pseudoprimes; }
+    // Сколько кандидатов прошли строгую проверку, но не понадобились: при
+    // параллельном поиске два потока иногда находят простое почти одновременно.
+    size_t extra = totStrong - totPseudo > ks.primes.size() ? totStrong - totPseudo - ks.primes.size() : 0;
+    std::cout << "Потоков: " << ks.threads << "; малых простых в решете: " << ks.sievePrimes
+              << "; перезапусков генерации: " << ks.restarts << ".\n"
+              << "Тест Ферма отсеял " << (totFermat - totStrong) << " составных из " << totFermat
+              << "; до строгой проверки BPSW + Миллер–Рабин дошли " << totStrong << " кандидат(ов) на "
+              << ks.primes.size() << " простых";
+    if (!ks.pseudoKnown && totStrong > ks.primes.size()) {
+        std::cout << " (лишние — псевдопростые по Ферма или простые, найденные потоками одновременно;\n"
+                  << "ключ создан старой версией, которая их не различала)";
+    } else if (totPseudo || extra) {
+        std::cout << " (";
+        if (totPseudo) std::cout << "псевдопростых по Ферма, отсеянных строгой проверкой: " << totPseudo;
+        if (totPseudo && extra) std::cout << "; ";
+        if (extra) std::cout << "лишних простых, найденных параллельными потоками одновременно: " << extra;
+        std::cout << ")";
+    }
+    std::cout << ".\n";
+}
+
+static void benchRsa(const rsa::PrivateKey& sk) {
+    const size_t k = (sk.n.bits() + 7) / 8;
+    const size_t u = sk.primes.size();
+    rsa::PublicKey pub = sk.pub();
+    std::vector<uint8_t> mb = securerand::bytes(rsa::oaepMaxMessage(k, STREEBOG_LEN));
+    auto ct = rsa::oaepEncryptBlock(pub, streebogHashFn(), STREEBOG_LEN, cspRandomFn(), mb.data(), mb.size());
+    rsa::Mpz c, m, mRaw;
+    rsa::os2ip(c, ct.data(), ct.size());
+    rsa::Mpz rnd;
+    { auto rb = securerand::bytes(k - 1); rsa::os2ip(rnd, rb.data(), rb.size()); }
+    std::vector<uint8_t> dec;
+
+    std::cout << "\nRSA: замер операций (каждая операция RSADP занимает доли секунды — подождите)...\n";
+    std::vector<BenchRow> rows;
+    rows.push_back({"RSAEP: c = m^e mod n (e = 65537)", fmtBytes(k),
+        measure([&] { rsa::rsaep(m, pub, rnd); g_benchSink ^= static_cast<uint8_t>(mpz_fdiv_ui(m, 251)); }, 10, 5, 0.5, 100), 0});
+    rows.push_back({"OAEP-шифрование блока", fmtBytes(mb.size()),
+        measure([&] { g_benchSink ^= rsa::oaepEncryptBlock(pub, streebogHashFn(), STREEBOG_LEN, cspRandomFn(),
+                                                             mb.data(), mb.size())[5]; }, 1, 5, 0.5, 100), 0});
+    TimingStat par = measure([&] { rsa::rsadp(m, sk, c, true); }, 1, 3, 1.0, 10);
+    rows.push_back({"RSADP: CRT, потоков: " + std::to_string(u), fmtBytes(k), par, 0});
+    TimingStat seq = measure([&] { rsa::rsadp(m, sk, c, false); }, 1, 3, 0, 3);
+    rows.push_back({"RSADP: CRT, потоков: 1", fmtBytes(k), seq, 0});
+    TimingStat noCrt = measure([&] { mpz_powm(mRaw, c, sk.d, sk.n); }, 1, 1, 0, 1, false);
+    rows.push_back({"RSADP без CRT: c^d mod n", fmtBytes(k), noCrt, 0});
+    rows.push_back({"OAEP-расшифрование блока", fmtBytes(mb.size()),
+        measure([&] { rsa::oaepDecryptBlock(sk, streebogHashFn(), STREEBOG_LEN, ct, dec); }, 1, 3, 1.0, 10), 0});
+    printBenchTable("RSA-" + std::to_string(sk.n.bits()) + " (" + std::to_string(u) +
+                    " простых по " + std::to_string(sk.primes[0].bits()) + " бит, OAEP + Стрибог-512)", rows);
+
+    bool same = mpz_cmp(m, mRaw) == 0;
+    std::cout << "Проверка: результаты CRT и прямого c^d mod n " << (same ? "совпадают" : "НЕ СОВПАДАЮТ") << ".\n"
+              << "Ускорение CRT относительно c^d mod n: x" << fmtNum(noCrt.median / par.median, 1)
+              << " (из них за счёт параллельности: x" << fmtNum(seq.median / par.median, 2) << ").\n"
+              << "Расшифрование дороже шифрования в x" << fmtNum(par.median / rows[0].t.median, 0)
+              << " раз: показатель d длинный, e = 65537 — 17 бит.\n";
+}
+
+static void printSystemInfo() {
+    std::vector<std::vector<std::string>> rows = {
+        {"Потоков процессора", std::to_string(rsa::threadCount())},
+        {"Версия GMP", gmp_version},
+#if defined(__clang__)
+        {"Компилятор", std::string("clang ") + __clang_version__},
+#elif defined(__GNUC__)
+        {"Компилятор", std::string("gcc ") + __VERSION__},
+#endif
+        {"Размер модуля RSA / число простых", std::to_string(RSA_MODULUS_BITS) + " бит / " + std::to_string(RSA_PRIMES)},
+        {"Итераций PBKDF2", std::to_string(PBKDF2_ITERATIONS)},
+    };
+    std::cout << "\n";
+    printAsciiTable({"Параметр", "Значение"}, rows);
+}
+
+// Полный замер из командной строки (./auth3fa --bench): Стрибог, Кузнечик
+// и RSA-32768 с генерацией нового ключа и статистикой поиска простых.
+static int runCommandLineBench() {
+    std::cout << "=== Производительность: Стрибог, Кузнечик, RSA-" << RSA_MODULUS_BITS << " ===\n";
+    printSystemInfo();
+    benchStreebog();
+    benchKuznyechik();
+    std::cout << "\nГенерация ключа RSA-" << RSA_MODULUS_BITS << " для замера...\n";
+    rsa::KeygenStats ks;
+    auto t0 = BenchClock::now();
+    rsa::PrivateKey sk = rsa::generateKey(RSA_MODULUS_BITS, RSA_PRIMES, cspRandomFn(), [&](const std::string& msg) {
+        bool interim = msg.size() >= 3 && msg.compare(msg.size() - 3, 3, "...") == 0;
+        std::cout << "\r  [" << static_cast<long>(secondsSince(t0)) << " с] " << msg << "          "
+                  << (interim ? "" : "\n") << std::flush;
+    }, &ks);
+    printKeygenStats(ks);
+    benchRsa(sk);
+    return 0;
+}
+
+// ============================================================
+// Сессия авторизованного пользователя:
+// шифрование сообщений (Кузнечик / RSA-32768) и PDF-отчёт
+// ============================================================
+struct UserSession {
+    std::string username;
+    std::vector<uint8_t> kek;      // 64 байта, выведены из пароля (PBKDF2)
+    std::vector<uint8_t> msgKey;   // 64 байта, ключ «Кузнечика» для сообщений
+    std::map<std::string, std::string> keys;
+    bool rsaLoaded = false;
+    rsa::PrivateKey rsaKey;
+    gost3410::KeyPair sigKey;      // ключ ЭЦП ГОСТ Р 34.10-2012
+    asn1::Bytes sigCert;           // самоподписанный сертификат X.509 с этим ключом
+    ~UserSession() { secureWipe(kek); secureWipe(msgKey); sigKey.d.wipe(); }
+};
+
+static std::string formatTime(uint64_t t) {
+    std::time_t tt = static_cast<std::time_t>(t);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    char buf[64];
+    std::strftime(buf, sizeof buf, "%d.%m.%Y %H:%M:%S", &tm);
+    return buf;
+}
+
+static std::string algoTitle(const std::string& algo) {
+    if (algo == "KUZ") return "Кузнечик (ГОСТ Р 34.12-2015), режим CTR + имитовставка OMAC";
+    if (algo == "RSA") return "RSA-32768, дополнение OAEP со Стрибогом-512";
+    return algo;
+}
+static std::string algoShort(const std::string& algo) {
+    if (algo == "KUZ") return "Кузнечик";
+    if (algo == "RSA") return "RSA-32768";
+    return algo;
+}
+
+// Отпечаток открытого ключа: первые 20 байт Стрибога-512 от модуля n
+static std::string rsaFingerprint(const rsa::Mpz& n) {
+    auto bytes = rsa::i2osp(n, (n.bits() + 7) / 8);
+    auto h = streebog512Bytes(bytes.data(), bytes.size());
+    std::string hex = toHex(std::vector<uint8_t>(h.begin(), h.begin() + 20)), out;
+    for (size_t i = 0; i < hex.size(); i += 4) { if (i) out += ' '; out += hex.substr(i, 4); }
+    return out;
+}
+
+// ------------------------------------------------------------
+// Ключ электронной подписи ГОСТ Р 34.10-2012 и сертификат
+// ------------------------------------------------------------
+static pdfsig::HashFn streebog256HashFn() {
+    return [](const uint8_t* d, size_t n) { return streebog256Bytes(d, n); };
+}
+
+static std::string certFingerprint(const asn1::Bytes& der) {
+    auto h = streebog256Bytes(der.data(), der.size());
+    std::string hex = toHex(std::vector<uint8_t>(h.begin(), h.begin() + 16)), out;
+    for (size_t i = 0; i < hex.size(); i += 4) { if (i) out += ' '; out += hex.substr(i, 4); }
+    return out;
+}
+
+// Загружает ключ подписи из хранилища, при первом входе — создаёт ключ и
+// самоподписанный сертификат. Закрытый ключ хранится запечатанным на KEK.
+static bool ensureSigningKey(UserSession& s, std::string& err) {
+    const auto& curve = gost3410::workCurve();
+    if (!s.keys.count("sig_priv")) {
+        gost3410::KeyPair kp = gost3410::generateKey(curve, cspRandomFn());
+        pdfsig::CertInfo info;
+        info.commonName = s.username;
+        info.notBefore = static_cast<time_t>(nowUnixTime());
+        info.notAfter = info.notBefore + 5LL * 365 * 24 * 3600;
+        asn1::Bytes cert = pdfsig::buildSelfSignedCert(curve, kp, info, streebog256HashFn(), cspRandomFn());
+        std::string dHex = kp.d.toHex();
+        s.keys["sig_priv"] = sealedToString(kuzSeal(s.kek, dHex));
+        s.keys["sig_pub"] = toHex(gost3410::encodePublicKey(kp.Q));
+        s.keys["sig_cert"] = toHex(cert);
+        s.keys["sig_created"] = std::to_string(nowUnixTime());
+        secureWipe(dHex);
+        if (!saveKeyValueFile(vaultKeysFile(s.username), s.keys)) { err = "не удалось сохранить ключ подписи"; return false; }
+        std::cout << "Создан ключ электронной подписи ГОСТ Р 34.10-2012 и сертификат.\n";
+    }
+    SealedData sealed;
+    std::string dHex;
+    if (!sealedFromString(s.keys["sig_priv"], sealed) || !kuzOpen(s.kek, sealed, dHex)) {
+        err = "закрытый ключ подписи повреждён (имитовставка не сошлась)"; return false;
+    }
+    bool ok = s.sigKey.d.fromHex(dHex);
+    secureWipe(dHex);
+    if (!ok) { err = "закрытый ключ подписи повреждён"; return false; }
+    s.sigKey.Q = gost3410::publicFromPrivate(curve, s.sigKey.d);
+    if (toHex(gost3410::encodePublicKey(s.sigKey.Q)) != s.keys["sig_pub"]) { err = "ключ подписи не совпадает с открытым"; return false; }
+    if (!hexDecode(s.keys["sig_cert"], s.sigCert)) { err = "сертификат повреждён"; return false; }
+    return true;
+}
+
+// Печать результата проверки подписи PDF (ASCII-таблица)
+static void printVerifyReport(const pdfsig::VerifyReport& r, const UserSession* s) {
+    auto yn = [](bool b) { return std::string(b ? "OK" : "ОШИБКА"); };
+    if (!r.found) { std::cout << "Результат: " << r.error << ".\n"; return; }
+    std::vector<std::vector<std::string>> rows = {
+        {"Подписант (CN сертификата)", r.subjectCN.empty() ? "-" : r.subjectCN},
+        {"Организация", r.organization.empty() ? "-" : r.organization},
+        {"Время подписи", r.signingTime.empty() ? "-" : r.signingTime},
+        {"Сертификат действителен", r.notBefore + " - " + r.notAfter},
+        {"Отпечаток сертификата (Стрибог-256)", r.certDer.empty() ? "-" : certFingerprint(r.certDer)},
+        {"Алгоритм подписи", "ГОСТ Р 34.10-2012, 256 бит (OID " + std::string(pdfsig::OID_GOST_KEY_256) + ")"},
+        {"Хеш-функция", "ГОСТ Р 34.11-2012 Стрибог-256 (OID " + r.digestAlgOid + ")"},
+        {"Параметры кривой", r.curveOid},
+        {"Размер файла / подписано байт", std::to_string(r.fileSize) + " / " + std::to_string(r.signedBytes)},
+        {"/ByteRange", "[" + std::to_string(r.range[0]) + " " + std::to_string(r.range[1]) + " " +
+                       std::to_string(r.range[2]) + " " + std::to_string(r.range[3]) + "]"},
+        {"Размер CMS", std::to_string(r.cmsSize) + " Б"},
+        {"---"},
+        {"Подпись охватывает весь файл", yn(r.coversWholeFile)},
+        {"Хеш документа совпал с messageDigest", yn(r.digestOk)},
+        {"Подпись ГОСТ Р 34.10-2012 верна", yn(r.signatureOk)},
+        {"Самоподпись сертификата верна", yn(r.certSelfSigOk)},
+    };
+    if (s) {
+        bool mine = !s->sigCert.empty() && r.certDer == s->sigCert;
+        rows.push_back({"Подписано ключом пользователя " + s->username, mine ? "да" : "нет"});
+    }
+    printAsciiTable({"Параметр", "Значение"}, rows);
+    if (!r.digestOk && r.parsed)
+        std::cout << "  хеш в подписи:   " << toHex(r.messageDigest) << "\n  хеш документа:   " << toHex(r.computedDigest) << "\n";
+    if (!r.error.empty()) std::cout << "Ошибка разбора: " << r.error << "\n";
+    std::cout << "Результат: " << (r.valid() ? "ПОДПИСЬ ВЕРНА, документ не изменялся после подписания."
+                                             : "ПОДПИСЬ НЕДЕЙСТВИТЕЛЬНА — документ изменён или подпись повреждена.") << "\n";
+}
+
+// Открывает (или при первом использовании создаёт) хранилище пользователя
+static bool unlockVault(const std::string& username, const std::string& password,
+                        UserSession& s, std::string& err) {
+    std::error_code ec;
+    std::filesystem::create_directories(vaultDirFor(username), ec);
+    if (ec) { err = "не удалось создать каталог " + vaultDirFor(username); return false; }
+    restrictToOwner(VAULT_DIR, true);
+    restrictToOwner(vaultDirFor(username), true);
+
+    s.username = username;
+    std::string keysPath = vaultKeysFile(username);
+
+    if (!vaultExists(username)) {
+        std::vector<uint8_t> salt = securerand::bytes(16);
+        s.kek = pbkdf2Streebog512(password, salt, PBKDF2_ITERATIONS, 64);
+        s.msgKey = securerand::bytes(64);
+        std::string mk(s.msgKey.begin(), s.msgKey.end());
+        s.keys["kdf_salt"] = toHex(salt);
+        s.keys["kdf_iter"] = std::to_string(PBKDF2_ITERATIONS);
+        s.keys["msg_key"] = sealedToString(kuzSeal(s.kek, mk));
+        s.keys["created"] = std::to_string(nowUnixTime());
+        secureWipe(mk);
+        if (!saveKeyValueFile(keysPath, s.keys)) { err = "не удалось записать " + keysPath; return false; }
+        return true;
+    }
+
+    s.keys = loadKeyValueFile(keysPath);
+    std::vector<uint8_t> salt;
+    uint32_t iter = 0;
+    try { iter = static_cast<uint32_t>(std::stoul(s.keys["kdf_iter"])); } catch (...) { iter = 0; }
+    SealedData sealed;
+    if (!hexDecode(s.keys["kdf_salt"], salt) || iter == 0 || !sealedFromString(s.keys["msg_key"], sealed)) {
+        err = "файл ключей повреждён";
+        return false;
+    }
+    s.kek = pbkdf2Streebog512(password, salt, iter, 64);
+    std::string mk;
+    if (!kuzOpen(s.kek, sealed, mk) || mk.size() != 64) {
+        err = "ключ, выведенный из пароля, не подходит (имитовставка не сошлась) — хранилище повреждено или подменено";
+        return false;
+    }
+    s.msgKey.assign(mk.begin(), mk.end());
+    secureWipe(mk);
+    return true;
+}
+
+static bool loadRsaKey(UserSession& s, std::string& err) {
+    if (s.rsaLoaded) return true;
+    if (!s.keys.count("rsa_priv")) { err = "ключ RSA ещё не создан"; return false; }
+    rsa::Mpz n, e;
+    SealedData sealed;
+    if (!n.fromHex(s.keys["rsa_n"]) || !e.fromHex(s.keys["rsa_e"]) || !sealedFromString(s.keys["rsa_priv"], sealed)) {
+        err = "запись ключа RSA повреждена"; return false;
+    }
+    std::string secret;
+    if (!kuzOpen(s.kek, sealed, secret)) { err = "имитовставка закрытого ключа RSA не сошлась"; return false; }
+    bool ok = s.rsaKey.deserializeSecret(secret, n, e);
+    secureWipe(secret);
+    if (!ok) { err = "закрытый ключ RSA не соответствует открытому"; return false; }
+    s.rsaLoaded = true;
+    return true;
+}
+
+// Генерирует ключ RSA-32768 при первом использовании (один раз на пользователя)
+static bool ensureRsaKey(UserSession& s) {
+    std::string err;
+    if (s.keys.count("rsa_priv")) {
+        if (loadRsaKey(s, err)) return true;
+        std::cout << "Ошибка: " << err << ".\n";
+        return false;
+    }
+    std::cout << "\nУ вас ещё нет ключа RSA-32768. Он создаётся один раз и дальше хранится\n"
+              << "в зашифрованном виде. Нужно найти " << RSA_PRIMES << " случайных простых числа по "
+              << RSA_MODULUS_BITS / RSA_PRIMES << " бит;\n"
+              << "поиск идёт параллельно на всех ядрах процессора (" << rsa::threadCount() << " шт.)\n"
+              << "и обычно занимает от полуминуты до нескольких минут.\n"
+              << "Сгенерировать ключ сейчас? (д/н): ";
+    std::string ans;
+    std::getline(std::cin, ans);
+    if (ans != "д" && ans != "Д" && ans != "y" && ans != "Y") { std::cout << "Отменено.\n"; return false; }
+
+    auto t0 = std::chrono::steady_clock::now();
+    // Промежуточный прогресс (оканчивается на "...") перерисовывает одну и ту же
+    // строку через '\r', итоговые сообщения печатаются отдельными строками.
+    rsa::KeygenStats ks;
+    rsa::PrivateKey key = rsa::generateKey(RSA_MODULUS_BITS, RSA_PRIMES, cspRandomFn(), [&](const std::string& msg) {
+        long el = static_cast<long>(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        bool interim = msg.size() >= 3 && msg.compare(msg.size() - 3, 3, "...") == 0;
+        std::cout << "\r  [" << el << " с] " << msg << "          " << (interim ? "" : "\n") << std::flush;
+    }, &ks);
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    std::string secret = key.serializeSecret();
+    s.keys["rsa_n"] = key.n.toHex();
+    s.keys["rsa_e"] = key.e.toHex();
+    s.keys["rsa_priv"] = sealedToString(kuzSeal(s.kek, secret));
+    s.keys["rsa_primes"] = std::to_string(key.primes.size());
+    s.keys["rsa_created"] = std::to_string(nowUnixTime());
+    s.keys["rsa_gen_seconds"] = std::to_string(static_cast<long>(secs + 0.5));
+    s.keys["rsa_gen_stats"] = serializeKeygenStats(ks);
+    secureWipe(secret);
+    if (!saveKeyValueFile(vaultKeysFile(s.username), s.keys)) {
+        std::cout << "Ошибка: не удалось сохранить ключ.\n";
+        return false;
+    }
+    s.rsaKey = key;
+    s.rsaLoaded = true;
+    std::cout << "Ключ RSA-" << key.n.bits() << " создан за " << static_cast<long>(secs + 0.5) << " с.\n"
+              << "Отпечаток открытого ключа: " << rsaFingerprint(key.n) << "\n";
+    printKeygenStats(ks);
+    return true;
+}
+
+static std::string readMultilineMessage() {
+    std::cout << "Введите сообщение (можно в несколько строк; пустая строка — конец ввода):\n";
+    std::string msg, line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) break;
+        if (!msg.empty()) msg += '\n';
+        msg += line;
+    }
+    return msg;
+}
+
+static void encryptNewMessage(UserSession& s) {
+    std::cout << "\nВыберите алгоритм шифрования:\n"
+              << "1. Кузнечик (ГОСТ Р 34.12-2015), 256-битный ключ\n"
+              << "2. RSA-32768 (OAEP)\n"
+              << "Выбор: ";
+    std::string choice;
+    std::getline(std::cin, choice);
+    std::string algo;
+    if (choice == "1") algo = "KUZ";
+    else if (choice == "2") algo = "RSA";
+    else { std::cout << "Некорректный выбор.\n"; return; }
+
+    if (algo == "RSA" && !ensureRsaKey(s)) return;
+
+    std::string msg = readMultilineMessage();
+    if (msg.empty()) { std::cout << "Пустое сообщение — отменено.\n"; return; }
+
+    auto t0 = std::chrono::steady_clock::now();
+    StoredMessage m;
+    m.algo = algo;
+    m.created = nowUnixTime();
+    size_t ctBytes = 0;
+    std::string preview;
+    if (algo == "KUZ") {
+        SealedData sd = kuzSeal(s.msgKey, msg);
+        m.payload = sealedToString(sd);
+        ctBytes = sd.ct.size();
+        preview = toHex(sd.ct);
+    } else {
+        auto blocks = rsa::encryptMessage(s.rsaKey.pub(), streebogHashFn(), STREEBOG_LEN, cspRandomFn(), msg);
+        for (size_t i = 0; i < blocks.size(); i++) {
+            if (i) m.payload += ':';
+            m.payload += toHex(blocks[i]);
+            ctBytes += blocks[i].size();
+        }
+        preview = toHex(blocks[0]);
+    }
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    m.encSec = ms / 1000.0;
+
+    auto msgs = loadMessages(s.username);
+    uint64_t maxId = 0;
+    for (const auto& x : msgs) maxId = std::max(maxId, x.id);
+    m.id = maxId + 1;
+    size_t ptBytes = msg.size();
+    secureWipe(msg);
+
+    if (!appendMessage(s.username, m)) { std::cout << "Ошибка: не удалось сохранить сообщение.\n"; return; }
+    std::cout << "\nСообщение №" << m.id << " зашифровано: " << algoTitle(algo) << ".\n"
+              << "Открытый текст: " << ptBytes << " байт, шифртекст: " << ctBytes << " байт, время: "
+              << std::fixed << std::setprecision(1) << ms << " мс.\n";
+    std::cout.unsetf(std::ios::fixed);
+    std::cout << "Начало шифртекста: " << preview.substr(0, 64) << (preview.size() > 64 ? "..." : "") << "\n";
+}
+
+// Расшифровывает сохранённое сообщение. status — результат проверки целостности.
+static bool decryptStored(UserSession& s, const StoredMessage& m, std::string& text, std::string& status) {
+    text.clear();
+    if (m.algo == "KUZ") {
+        SealedData sd;
+        if (!sealedFromString(m.payload, sd)) { status = "ОШИБКА: запись повреждена"; return false; }
+        if (!kuzOpen(s.msgKey, sd, text)) { status = "ОШИБКА: имитовставка не совпала (данные изменены)"; return false; }
+        status = "имитовставка OMAC верна, целостность подтверждена";
+        return true;
+    }
+    if (m.algo == "RSA") {
+        std::string err;
+        if (!loadRsaKey(s, err)) { status = "ОШИБКА: " + err; return false; }
+        std::vector<std::vector<uint8_t>> blocks;
+        for (const auto& part : splitByDelimiter(m.payload, ':')) {
+            std::vector<uint8_t> b;
+            if (!hexDecode(part, b)) { status = "ОШИБКА: запись повреждена"; return false; }
+            blocks.push_back(std::move(b));
+        }
+        if (!rsa::decryptMessage(s.rsaKey, streebogHashFn(), STREEBOG_LEN, blocks, text)) {
+            status = "ОШИБКА: проверка OAEP не пройдена (данные изменены)"; return false;
+        }
+        status = "проверка OAEP пройдена, CRT-результат перепроверен";
+        return true;
+    }
+    status = "ОШИБКА: неизвестный алгоритм " + m.algo;
+    return false;
+}
+
+static size_t ciphertextBytes(const StoredMessage& m) {
+    if (m.algo == "KUZ") { SealedData sd; return sealedFromString(m.payload, sd) ? sd.ct.size() : 0; }
+    size_t hexChars = 0;
+    for (const auto& p : splitByDelimiter(m.payload, ':')) hexChars += p.size();
+    return hexChars / 2;
+}
+
+static void listMessages(UserSession& s) {
+    auto msgs = loadMessages(s.username);
+    if (msgs.empty()) { std::cout << "У вас пока нет зашифрованных сообщений.\n"; return; }
+    std::vector<std::vector<std::string>> rows;
+    for (const auto& m : msgs) {
+        rows.push_back({std::to_string(m.id), formatTime(m.created), algoShort(m.algo),
+                        std::to_string(ciphertextBytes(m))});
+    }
+    std::cout << "\n";
+    printAsciiTable({"№", "Дата", "Алгоритм", "Шифртекст, Б"}, rows,
+                    {Align::Right, Align::Left, Align::Left, Align::Right});
+}
+
+// ------------------------------------------------------------
+// Анализ всех сообщений: расшифровка, размеры, время, целостность.
+// Используется и для статистики в меню, и для PDF-отчёта.
+// ------------------------------------------------------------
+struct MessageReport {
+    StoredMessage m;
+    size_t ptBytes = 0, ctBytes = 0;
+    double decryptSec = 0;
+    bool ok = false;
+    std::string status, text;
+};
+
+static std::vector<MessageReport> analyzeMessages(UserSession& s, const std::vector<StoredMessage>& msgs) {
+    std::vector<MessageReport> res;
+    size_t idx = 0;
+    for (const auto& m : msgs) {
+        idx++;
+        std::cout << "\r  Расшифровка сообщений: " << idx << "/" << msgs.size() << std::flush;
+        MessageReport r;
+        r.m = m;
+        r.ctBytes = ciphertextBytes(m);
+        auto t0 = BenchClock::now();
+        r.ok = decryptStored(s, m, r.text, r.status);
+        r.decryptSec = secondsSince(t0);
+        r.ptBytes = r.text.size();
+        res.push_back(std::move(r));
+    }
+    if (!msgs.empty()) std::cout << "\n";
+    return res;
+}
+
+// Сводка по алгоритмам: строки ASCII-таблицы
+static std::vector<std::string> messageStatsTable(const std::vector<MessageReport>& reps) {
+    struct Agg { size_t n = 0, pt = 0, ct = 0, ok = 0, encN = 0; double dec = 0, enc = 0; };
+    std::map<std::string, Agg> by;
+    Agg total;
+    for (const auto& r : reps) {
+        for (Agg* a : {&by[r.m.algo], &total}) {
+            a->n++; a->pt += r.ptBytes; a->ct += r.ctBytes; a->ok += r.ok; a->dec += r.decryptSec;
+            if (r.m.encSec >= 0) { a->encN++; a->enc += r.m.encSec; }
+        }
+    }
+    auto row = [](const std::string& name, const Agg& a) {
+        return std::vector<std::string>{
+            name, std::to_string(a.n), std::to_string(a.pt), std::to_string(a.ct),
+            a.pt ? "x" + fmtNum(double(a.ct) / a.pt, 2) : "-",
+            a.encN ? fmtTime(a.enc / a.encN) : "-",
+            a.n ? fmtTime(a.dec / a.n) : "-",
+            std::to_string(a.ok) + "/" + std::to_string(a.n)};
+    };
+    std::vector<std::vector<std::string>> rows;
+    for (const auto& kv : by) rows.push_back(row(algoShort(kv.first), kv.second));
+    rows.push_back({"---"});
+    rows.push_back(row("Всего", total));
+    return asciiTable({"Алгоритм", "Сообщений", "Открытый текст, Б", "Шифртекст, Б", "Расширение",
+                       "Ср. шифрование", "Ср. расшифровка", "Целостность"}, rows,
+                      {Align::Left, Align::Right, Align::Right, Align::Right, Align::Right, Align::Right,
+                       Align::Right, Align::Right});
+}
+
+// Таблица по каждому сообщению
+static std::vector<std::string> messageListTable(const std::vector<MessageReport>& reps) {
+    std::vector<std::vector<std::string>> rows;
+    for (const auto& r : reps) {
+        rows.push_back({std::to_string(r.m.id), formatTime(r.m.created), algoShort(r.m.algo),
+                        std::to_string(r.ptBytes), std::to_string(r.ctBytes),
+                        r.m.encSec >= 0 ? fmtTime(r.m.encSec) : "-", fmtTime(r.decryptSec),
+                        r.ok ? "OK" : "ОШИБКА"});
+    }
+    return asciiTable({"№", "Дата", "Алгоритм", "Текст, Б", "Шифртекст, Б", "Шифрование", "Расшифровка",
+                       "Целостность"}, rows,
+                      {Align::Right, Align::Left, Align::Left, Align::Right, Align::Right, Align::Right,
+                       Align::Right, Align::Left});
+}
+
+// Пункт меню «Статистика и производительность»
+static void showStatsAndPerformance(UserSession& s) {
+    auto msgs = loadMessages(s.username);
+    if (msgs.empty()) {
+        std::cout << "\nСообщений пока нет — статистика по ним пуста.\n";
+    } else {
+        std::cout << "\nСтатистика сообщений пользователя " << s.username << ":\n";
+        auto reps = analyzeMessages(s, msgs);
+        for (const auto& l : messageListTable(reps)) std::cout << l << "\n";
+        for (const auto& l : messageStatsTable(reps)) std::cout << l << "\n";
+        for (auto& r : reps) secureWipe(r.text);
+    }
+
+    rsa::KeygenStats ks;
+    if (s.keys.count("rsa_gen_stats") && parseKeygenStats(s.keys["rsa_gen_stats"], ks)) printKeygenStats(ks);
+
+    std::cout << "\nЗапустить замеры производительности Стрибога, Кузнечика и RSA? Займёт до минуты (д/н): ";
+    std::string ans;
+    std::getline(std::cin, ans);
+    if (ans != "д" && ans != "Д" && ans != "y" && ans != "Y") return;
+    printSystemInfo();
+    benchStreebog();
+    benchKuznyechik();
+    std::string err;
+    if (s.keys.count("rsa_priv") && loadRsaKey(s, err)) benchRsa(s.rsaKey);
+    else std::cout << "\nRSA: ключ ещё не создан — зашифруйте сообщение через RSA, чтобы он появился,\n"
+                   << "или запустите ./auth3fa --bench (сгенерирует отдельный ключ для замера).\n";
+}
+
+// Пункт меню «Проверка по контрольным примерам ГОСТ»
+static void showGostSelfTest() {
+    std::cout << "\nКонтрольные примеры ГОСТ Р 34.11-2012, 34.12-2015, 34.13-2015, Р 50.1.113-2016:\n";
+    auto kats = gostKats();
+    printKatDetails(kats);
+    std::cout << "\nСводка:\n";
+    printKatTable(kats);
+}
+
+static void showDecrypted(UserSession& s) {
+    auto msgs = loadMessages(s.username);
+    if (msgs.empty()) { std::cout << "У вас пока нет зашифрованных сообщений.\n"; return; }
+    std::cout << "Номер сообщения: ";
+    std::string in;
+    std::getline(std::cin, in);
+    auto it = std::find_if(msgs.begin(), msgs.end(), [&](const StoredMessage& m) { return std::to_string(m.id) == in; });
+    if (it == msgs.end()) { std::cout << "Сообщение не найдено.\n"; return; }
+    auto t0 = std::chrono::steady_clock::now();
+    std::string text, status;
+    bool ok = decryptStored(s, *it, text, status);
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "\nСообщение №" << it->id << " (" << algoTitle(it->algo) << ", " << formatTime(it->created) << ")\n"
+              << "Статус: " << status << "; расшифровано за " << std::fixed << std::setprecision(1) << ms << " мс\n";
+    std::cout.unsetf(std::ios::fixed);
+    if (ok) std::cout << "----- текст -----\n" << text << "\n-----------------\n";
+    secureWipe(text);
+}
+
+// Поиск TrueType-шрифта с кириллицей. Можно задать свой через переменную
+// окружения PDF_FONT / PDF_FONT_MONO или положить font.ttf рядом с программой.
+static std::string findFontPath(bool mono) {
+    const char* env = std::getenv(mono ? "PDF_FONT_MONO" : "PDF_FONT");
+    std::vector<std::string> candidates;
+    if (env && *env) candidates.push_back(env);
+    if (mono) {
+        candidates.insert(candidates.end(), {
+            "font_mono.ttf",
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
+            "/Library/Fonts/Courier New.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "C:\\Windows\\Fonts\\cour.ttf",
+        });
+    } else {
+        candidates.insert(candidates.end(), {
+            "font.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Verdana.ttf",
+            "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        });
+    }
+    for (const auto& c : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(c, ec)) return c;
+    }
+    return "";
+}
+
+static std::string sanitizeForFilename(const std::string& s) {
+    std::string out;
+    for (unsigned char c : s) out += (std::isalnum(c) || c == '-' || c == '_') ? static_cast<char>(c) : '_';
+    return out.empty() ? "user" : out;
+}
+
+// Итоги проверки по ГОСТ, сгруппированные по алгоритму (для PDF)
+static std::vector<std::string> gostSummaryTable() {
+    auto kats = gostKats();
+    std::vector<std::string> order;
+    std::map<std::string, std::pair<size_t, size_t>> agg;   // алгоритм -> (пройдено, всего)
+    std::map<std::string, std::string> src;
+    for (const auto& k : kats) {
+        if (!agg.count(k.algo)) order.push_back(k.algo);
+        agg[k.algo].first += k.ok();
+        agg[k.algo].second++;
+        src[k.algo] = k.source;
+    }
+    std::vector<std::vector<std::string>> rows;
+    size_t ok = 0;
+    for (const auto& a : order) {
+        rows.push_back({a, src[a], std::to_string(agg[a].first) + "/" + std::to_string(agg[a].second),
+                        agg[a].first == agg[a].second ? "OK" : "ОШИБКА"});
+        ok += agg[a].first;
+    }
+    rows.push_back({"---"});
+    rows.push_back({"Всего", "", std::to_string(ok) + "/" + std::to_string(kats.size()),
+                    ok == kats.size() ? "OK" : "ОШИБКА"});
+    return asciiTable({"Алгоритм", "Источник контрольных примеров", "Совпало", "Итог"}, rows,
+                      {Align::Left, Align::Left, Align::Right, Align::Left});
+}
+
+static void generatePdfReport(UserSession& s) {
+    auto msgs = loadMessages(s.username);
+    if (msgs.empty()) { std::cout << "У вас пока нет зашифрованных сообщений — отчёт пуст.\n"; return; }
+
+    pdf::Document doc;
+    std::string err, fontPath = findFontPath(false), monoPath = findFontPath(true);
+    if (fontPath.empty() || doc.addFont(fontPath, err) < 0) {
+        std::cout << "Не найден TrueType-шрифт с кириллицей" << (err.empty() ? "" : " (" + err + ")")
+                  << ". Укажите путь к .ttf в переменной окружения PDF_FONT или положите font.ttf рядом с программой.\n";
+        return;
+    }
+    int mono = 0;
+    if (!monoPath.empty()) { int f = doc.addFont(monoPath, err); if (f >= 0) mono = f; }
+    if (mono == 0)
+        std::cout << "Внимание: моноширинный шрифт не найден, ASCII-таблицы в PDF могут быть неровными\n"
+                  << "(задайте путь к моноширинному .ttf в PDF_FONT_MONO).\n";
+
+    auto reps = analyzeMessages(s, msgs);
+    uint64_t now = nowUnixTime();
+    size_t okCount = 0;
+    for (const auto& r : reps) okCount += r.ok;
+
+    doc.setTitle("Зашифрованные сообщения: " + s.username);
+    doc.setFooterLeft("Пользователь " + s.username + " | сформировано " + formatTime(now));
+
+    auto heading = [&](const std::string& t) { doc.space(10); doc.keepTogether(60); doc.paragraph(t, 13, 0, pdf::ACCENT); doc.space(2); };
+    auto table = [&](const std::vector<std::string>& lines) { doc.preformatted(lines, 7.5, mono, pdf::BLACK); };
+
+    doc.paragraph("Отчёт о зашифрованных сообщениях", 20, 0, pdf::ACCENT);
+    doc.space(4);
+    doc.paragraph("Пользователь: " + s.username, 11);
+    doc.paragraph("Дата формирования: " + formatTime(now), 11);
+    doc.paragraph("Сообщений: " + std::to_string(reps.size()) + ", успешно расшифровано и проверено: " +
+                  std::to_string(okCount), 11);
+
+    heading("1. Сводка по сообщениям");
+    table(messageListTable(reps));
+
+    heading("2. Статистика по алгоритмам");
+    table(messageStatsTable(reps));
+    doc.paragraph("Расширение - отношение размера шифртекста к открытому тексту. Кузнечик в режиме CTR не "
+                  "увеличивает данные (плюс 8 байт IV и 16 байт имитовставки), RSA-OAEP превращает каждые "
+                  "до 3966 байт текста в блок 4096 байт.", 8.5, 0, pdf::GRAY);
+
+    heading("3. Параметры защиты");
+    doc.paragraph("- Кузнечик: блочный шифр ГОСТ Р 34.12-2015, ключ 256 бит, режим гаммирования CTR "
+                  "(ГОСТ Р 34.13-2015) со случайным 64-битным IV, имитовставка OMAC 128 бит на отдельном ключе "
+                  "(Encrypt-then-MAC).", 9.5, 0, pdf::BLACK, 8);
+    std::string rsaLine = "- RSA: модуль 32768 бит, e = 65537, дополнение RSAES-OAEP (RFC 8017) с хеш-функцией "
+                          "Стрибог-512 (ГОСТ Р 34.11-2012) и MGF1; расшифрование по китайской теореме об остатках.";
+    if (s.keys.count("rsa_n")) {
+        rsa::Mpz n; n.fromHex(s.keys["rsa_n"]);
+        rsaLine += " Модуль собран из " + s.keys["rsa_primes"] + " простых (многопростой RSA, RFC 8017)." +
+                   " Отпечаток открытого ключа (Стрибог-512, 160 бит): " + rsaFingerprint(n) + ".";
+    }
+    doc.paragraph(rsaLine, 9.5, 0, pdf::BLACK, 8);
+    doc.paragraph("- Ключи хранятся только в зашифрованном виде; ключ к ним выводится из пароля пользователя "
+                  "функцией PBKDF2-HMAC-Стрибог-512 (" + s.keys["kdf_iter"] + " итераций).", 9.5, 0, pdf::BLACK, 8);
+
+    heading("4. Проверка реализации по контрольным примерам ГОСТ");
+    table(gostSummaryTable());
+
+    rsa::KeygenStats ks;
+    if (s.keys.count("rsa_gen_stats") && parseKeygenStats(s.keys["rsa_gen_stats"], ks)) {
+        heading("5. Генерация ключа RSA-" + std::to_string(RSA_MODULUS_BITS));
+        table(keygenStatsTable(ks));
+        doc.paragraph("Потоков: " + std::to_string(ks.threads) + "; малых простых в решете: " +
+                      std::to_string(ks.sievePrimes) + "; общее время: " + fmtTime(ks.seconds) + ".", 8.5, 0, pdf::GRAY);
+    }
+
+    heading("Сообщения");
+    size_t emojiTotal = 0;
+    for (auto& r : reps) {
+        const auto& m = r.m;
+        doc.keepTogether(120);
+        doc.space(6);
+        doc.paragraph("Сообщение №" + std::to_string(m.id) + " - " + algoShort(m.algo), 12, 0, pdf::ACCENT);
+        doc.paragraph("Дата: " + formatTime(m.created) + "    Алгоритм: " + algoTitle(m.algo), 9, 0, pdf::GRAY);
+        doc.space(3);
+
+        if (m.algo == "KUZ") {
+            SealedData sd;
+            sealedFromString(m.payload, sd);
+            doc.paragraph("IV (64 бита): " + toHex(sd.iv) + "    Имитовставка OMAC: " + toHex(sd.mac), 8.5, mono, pdf::BLACK);
+            doc.paragraph("Шифртекст (" + std::to_string(sd.ct.size()) + " байт, hex):", 9.5, 0, pdf::BLACK);
+            doc.paragraph(toHex(sd.ct), 7, mono, pdf::GRAY, 8, 1.25);
+        } else {
+            auto parts = splitByDelimiter(m.payload, ':');
+            doc.paragraph("Шифртекст (блоков RSA по 4096 байт: " + std::to_string(parts.size()) + ", hex):",
+                          9.5, 0, pdf::BLACK);
+            for (size_t b = 0; b < parts.size(); b++) {
+                if (parts.size() > 1) doc.paragraph("Блок " + std::to_string(b + 1) + ":", 8.5, 0, pdf::BLACK, 8);
+                doc.paragraph(parts[b], 6, mono, pdf::GRAY, 8, 1.25);
+            }
+        }
+        doc.space(4);
+        doc.paragraph("Расшифрованный текст:", 9.5, 0, pdf::BLACK);
+        if (r.ok) {
+            size_t removed = 0;
+            std::string clean = pdf::stripEmoji(r.text, removed);
+            emojiTotal += removed;
+            doc.paragraph(clean, 11, 0, pdf::BLACK, 8);
+            if (removed)
+                doc.paragraph("(из текста для PDF удалено эмодзи: " + std::to_string(removed) + ")", 8, 0, pdf::GRAY, 8);
+            secureWipe(clean);
+        }
+        doc.paragraph("Проверка: " + r.status, 8.5, 0, r.ok ? pdf::GREEN : pdf::RED, 8);
+        doc.paragraph("Размер: текст " + std::to_string(r.ptBytes) + " Б, шифртекст " + std::to_string(r.ctBytes) +
+                      " Б; зашифровано за " + (m.encSec >= 0 ? fmtTime(m.encSec) : std::string("- (не замерялось)")) +
+                      ", расшифровано за " + fmtTime(r.decryptSec), 8.5, 0, pdf::GRAY, 8);
+        secureWipe(r.text);
+    }
+
+    if (s.keys.count("rsa_n")) {
+        heading("Приложение: открытый ключ RSA-32768");
+        doc.paragraph("e = 65537 (0x" + s.keys["rsa_e"] + ")", 9.5, mono);
+        doc.paragraph("n (hex):", 9.5);
+        doc.paragraph(s.keys["rsa_n"], 6, mono, pdf::GRAY, 8, 1.25);
+    }
+
+    char ts[32];
+    std::time_t tt = static_cast<std::time_t>(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    std::strftime(ts, sizeof ts, "%Y%m%d_%H%M%S", &tm);
+    std::string fileName = "report_" + sanitizeForFilename(s.username) + "_" + ts + ".pdf";
+
+    // ---- электронная подпись ГОСТ Р 34.10-2012 ----
+    const auto& curve = gost3410::workCurve();
+    doc.keepTogether(230);   // заголовок и таблица подписи — на одной странице
+    heading("Электронная подпись");
+    {
+        std::vector<std::vector<std::string>> rows = {
+            {"Алгоритм подписи", "ГОСТ Р 34.10-2012, 256 бит"},
+            {"Хеш-функция", "ГОСТ Р 34.11-2012 (Стрибог-256)"},
+            {"Кривая", curve.name},
+            {"Подписант", s.username},
+            {"Отпечаток сертификата", certFingerprint(s.sigCert)},
+            {"Время подписи", formatTime(now)},
+            {"Формат", "CMS (PKCS#7 detached) внутри PDF"},
+        };
+        table(asciiTable({"Параметр", "Значение"}, rows));
+    }
+    doc.paragraph("Подпись охватывает весь файл, кроме самого значения подписи. Любое изменение документа после "
+                  "подписания делает подпись недействительной. Проверка: пункт меню \"Проверить подпись PDF\" или "
+                  "команда ./auth3fa --verify <файл.pdf>.", 8.5, 0, pdf::GRAY);
+    doc.paragraph("Открытый ключ проверки подписи (x || y, little-endian, hex):", 8.5, 0, pdf::BLACK);
+    doc.paragraph(s.keys["sig_pub"], 7, mono, pdf::GRAY, 8, 1.25);
+
+    pdf::Document::SignatureRequest req;
+    req.name = s.username;
+    req.reason = "Отчёт о зашифрованных сообщениях";
+    req.location = "infobez auth3fa";
+    req.contact = "ГОСТ Р 34.10-2012 / ГОСТ Р 34.11-2012";
+    req.when = static_cast<time_t>(now);
+    double signSec = 0;
+    req.signer = [&](const std::string& signedPart) {
+        auto t0 = BenchClock::now();
+        auto digest = streebog256Bytes(reinterpret_cast<const uint8_t*>(signedPart.data()), signedPart.size());
+        auto cms = pdfsig::buildCms(curve, s.sigKey, s.sigCert, digest, static_cast<time_t>(now),
+                                    streebog256HashFn(), cspRandomFn());
+        signSec = secondsSince(t0);
+        return cms;
+    };
+    doc.setSignature(req);
+
+    if (!doc.save(fileName, err)) { std::cout << "Ошибка: " << err << "\n"; return; }
+    std::error_code ec;
+    auto abs = std::filesystem::absolute(fileName, ec);
+    std::cout << "PDF-отчёт сохранён: " << (ec ? fileName : abs.string()) << "\n"
+              << "Сообщений: " << reps.size() << ", успешно расшифровано: " << okCount << ".\n"
+              << "Документ подписан ЭЦП ГОСТ Р 34.10-2012 за " << fmtTime(signSec) << " (подписано "
+              << doc.signedBytes() << " байт). Контрольная проверка подписи:\n";
+    printVerifyReport(pdfsig::verifyPdfFile(fileName, streebog256HashFn()), &s);
+    if (emojiTotal) std::cout << "Из текста сообщений в PDF удалено эмодзи: " << emojiTotal << ".\n";
+}
+
+static void showKeyInfo(UserSession& s) {
+    std::cout << "\n--- Ключи пользователя " << s.username << " ---\n"
+              << "Ключ из пароля: PBKDF2-HMAC-Стрибог-512, " << s.keys["kdf_iter"] << " итераций, соль 128 бит\n"
+              << "Ключ сообщений «Кузнечик»: 256 бит шифрование + 256 бит имитовставка (хранится зашифрованным)\n";
+    if (s.keys.count("rsa_n")) {
+        rsa::Mpz n; n.fromHex(s.keys["rsa_n"]);
+        uint64_t created = 0;
+        try { created = std::stoull(s.keys["rsa_created"]); } catch (...) {}
+        std::cout << "RSA: модуль " << n.bits() << " бит из " << s.keys["rsa_primes"]
+                  << " простых, e = 0x" << s.keys["rsa_e"] << "\n"
+                  << "     создан " << formatTime(created) << " за " << s.keys["rsa_gen_seconds"] << " с\n"
+                  << "     отпечаток: " << rsaFingerprint(n) << "\n";
+    } else {
+        std::cout << "RSA: ключ ещё не создан (будет создан при первом шифровании через RSA)\n";
+    }
+}
+
+static void runUserSession(const std::string& username, const std::string& password) {
+    UserSession s;
+    std::string err;
+    std::cout << "Открываем хранилище ключей (PBKDF2-HMAC-Стрибог-512)...\n";
+    if (!unlockVault(username, password, s, err)) {
+        std::cout << "Не удалось открыть хранилище: " << err << ".\n";
+        return;
+    }
+    if (!ensureSigningKey(s, err)) {
+        std::cout << "Не удалось открыть ключ электронной подписи: " << err << ".\n";
+        return;
+    }
+    while (true) {
+        std::cout << "\n--- Мои сообщения (" << username << ") ---\n"
+                  << "1. Зашифровать новое сообщение\n"
+                  << "2. Список моих сообщений\n"
+                  << "3. Расшифровать сообщение\n"
+                  << "4. Сформировать PDF-отчёт (все сообщения + расшифровка)\n"
+                  << "5. Сведения о ключах\n"
+                  << "6. Статистика и производительность (Стрибог, Кузнечик, RSA)\n"
+                  << "7. Проверка по контрольным примерам ГОСТ\n"
+                  << "8. Проверить подпись PDF-файла\n"
+                  << "9. Выйти из аккаунта\n"
+                  << "Выберите пункт: ";
+        std::string choice;
+        if (!std::getline(std::cin, choice)) return;
+        try {
+            if (choice == "1") encryptNewMessage(s);
+            else if (choice == "2") listMessages(s);
+            else if (choice == "3") showDecrypted(s);
+            else if (choice == "4") generatePdfReport(s);
+            else if (choice == "5") showKeyInfo(s);
+            else if (choice == "6") showStatsAndPerformance(s);
+            else if (choice == "7") showGostSelfTest();
+            else if (choice == "8") {
+                std::cout << "Путь к PDF-файлу: ";
+                std::string path;
+                std::getline(std::cin, path);
+                printVerifyReport(pdfsig::verifyPdfFile(path, streebog256HashFn()), &s);
+            }
+            else if (choice == "9") { std::cout << "Вы вышли из аккаунта.\n"; return; }
+            else std::cout << "Некорректный выбор, попробуйте снова.\n";
+        } catch (const std::exception& ex) {
+            std::cout << "Ошибка: " << ex.what() << "\n";
+        }
+    }
 }
 
 // ============================================================
@@ -1378,6 +3287,11 @@ static void loginUser(const SmtpConfig& smtpConfig) {
     std::cout << "Фактор 3 (email) пройден.\n";
 
     std::cout << "\nУспешный вход. Добро пожаловать, " << username << "!\n";
+
+    // Пароль нужен, чтобы вывести ключ хранилища (PBKDF2) — после этого
+    // он сразу затирается в памяти.
+    runUserSession(username, password);
+    secureWipe(password);
 }
 
 // ============================================================
@@ -1427,6 +3341,23 @@ static void recoverPassword(const SmtpConfig& smtpConfig) {
         return;
     }
 
+    // Ключи шифрования сообщений защищены ключом, выведенным из СТАРОГО
+    // пароля. Восстановление идёт без старого пароля, значит расшифровать
+    // их будет невозможно — честно предупреждаем и удаляем хранилище.
+    bool hadVault = vaultExists(username);
+    if (hadVault) {
+        std::cout << "\nВНИМАНИЕ: ваши зашифрованные сообщения и ключи (Кузнечик, RSA) защищены\n"
+                  << "ключом, который выводится из старого пароля. Без старого пароля их\n"
+                  << "невозможно расшифровать, поэтому после смены пароля они будут удалены.\n"
+                  << "Продолжить восстановление? (д/н): ";
+        std::string ans;
+        std::getline(std::cin, ans);
+        if (ans != "д" && ans != "Д" && ans != "y" && ans != "Y") {
+            std::cout << "Восстановление пароля отменено.\n";
+            return;
+        }
+    }
+
     std::cout << "Код подтверждён. Придумайте новый пароль.\n";
     std::string newPassword = choosePassword();
     if (newPassword.empty()) {
@@ -1441,72 +3372,46 @@ static void recoverPassword(const SmtpConfig& smtpConfig) {
         std::cout << "Ошибка: не удалось сохранить новый пароль.\n";
         return;
     }
+    if (hadVault) {
+        deleteVault(username);
+        std::cout << "Старое хранилище сообщений удалено.\n";
+    }
 
     std::cout << "Пароль успешно изменён. Теперь можно войти с новым паролем.\n";
-}
-
-// ============================================================
-// Самопроверка Стрибога-512: ./auth3fa --selftest
-// ============================================================
-// Сверяет реализацию с эталонными значениями (получены независимой
-// эталонной реализацией). Покрывает пустую строку, тестовый вектор M1 из
-// RFC 6986 и границы блоков (63/64/65/128/129 байт), чтобы поймать ошибки
-// паддинга и обработки последнего блока.
-static int runStreebogSelfTest() {
-    struct Vec { const char* name; std::string input; const char* expected; };
-    const std::vector<Vec> vectors = {
-        {"пустая строка",
-         std::string(),
-         "8e945da209aa869f0455928529bcae4679e9873ab707b55315f56ceb98bef0a7362f715528356ee83cda5f2aac4c6ad2ba3a715c1bcd81cb8e9f90bf4c1c1a8a"},
-        {"M1 из RFC 6986 (63 символа)",
-         std::string("012345678901234567890123456789012345678901234567890123456789012"),
-         "1b54d01a4af5b9d5cc3d86d68d285462b19abc2475222f35c085122be4ba1ffa00ad30f8767b3a82384c6574f024c311e2a481332b08ef7f41797891c1646f48"},
-        {"строка abc",
-         std::string("abc"),
-         "28156e28317da7c98f4fe2bed6b542d0dab85bb224445fcedaf75d46e26d7eb8d5997f3e0915dd6b7f0aab08d9c8beb0d8c64bae2ab8b3c8c6bc53b3bf0db728"},
-        {"'a' x 64 (ровно один блок)",
-         std::string(64, 'a'),
-         "613852076ca11156cf7d00f4feef0d5e3198e638f8e20eb02da2f5f7dca5b62dd9fb88e22e825f727ed6f25e4145dc868d0ef41e3e451e34b780e5547ade0d43"},
-        {"'a' x 65",
-         std::string(65, 'a'),
-         "42baf8f1711d47b6de63559743d09f5e11c9a348bea73b8bb3fe11be0ec0f6029856d70b936a00f7414b5f1ebd8e2bdaa74f3a893b90978da9cadcb72ae50338"},
-        {"'a' x 128 (два блока)",
-         std::string(128, 'a'),
-         "24741e27419b5e5796383cc54a915c5a69322c758f4391f48f2f120d832f840a82c4a23528d15612febfd2647ce64a97ba6ead9686617876f2d197087b47280f"},
-        {"'a' x 129",
-         std::string(129, 'a'),
-         "14ae98a06eedc746250d75a7c961ae7b058f5408f7c221df81b229935a3f6c134c704c6b431eb52b5ebcee51ea83d5f894415166c203ba3c740af1c43f610b5a"},
-        {"0xFF x 64",
-         std::string(64, '\xff'),
-         "41629de677d7e8090c3cd70affe3300d1e1cfba2db97945ec37feb4e1375bc02a53f00370b7d715b07f37f93cac844efadbfd1b85f9ddae3de9656c0e95affc7"},
-        {"0x00 x 64",
-         std::string(64, '\0'),
-         "b0fd29ac1b0df441769ff3fdb8dc564df67721d6ac06fb28ceffb7bbaa7948c6c014ac999235b58cb26fb60fb112a145d7b4ade9ae566bf2611402c552d20db7"},
-    };
-    int failed = 0;
-    for (const auto& v : vectors) {
-        std::string got = streebog512Hex(v.input);
-        bool ok = (got == v.expected);
-        std::cout << (ok ? "[OK]   " : "[FAIL] ") << v.name << "\n";
-        if (!ok) {
-            std::cout << "       ожидалось: " << v.expected << "\n"
-                      << "       получено:  " << got << "\n";
-            failed++;
-        }
-    }
-    std::cout << "\nИтог: " << (vectors.size() - failed) << " из " << vectors.size()
-              << " тестов пройдено. "
-              << (failed == 0 ? "Стрибог-512 работает корректно.\n" : "ЕСТЬ ОШИБКИ в реализации!\n");
-    return failed == 0 ? 0 : 1;
 }
 
 // ============================================================
 // main
 // ============================================================
 int main(int argc, char** argv) {
-    if (argc > 1 && std::string(argv[1]) == "--selftest") {
-        return runStreebogSelfTest();
+    std::string arg = argc > 1 ? argv[1] : "";
+    if (arg == "--selftest") {
+        std::cout << "=== Контрольные примеры ГОСТ: подробно ===\n";
+        auto kats = gostKats();
+        printKatDetails(kats);
+        std::cout << "\n=== Контрольные примеры ГОСТ: сводка ===\n";
+        bool ok = printKatTable(kats);
+        std::cout << "\n=== Дополнительные проверки ===\n";
+        ok = printKatTable(extraChecks()) && ok;
+        std::cout << "\n" << (ok ? "Все проверки пройдены.\n" : "ЕСТЬ ОШИБКИ!\n");
+        return ok ? 0 : 1;
     }
+    if (arg == "--bench") return runCommandLineBench();
+    if (arg == "--verify") {
+        if (argc < 3) { std::cout << "Использование: ./auth3fa --verify <файл.pdf>\n"; return 2; }
+        std::cout << "Проверка электронной подписи ГОСТ Р 34.10-2012: " << argv[2] << "\n";
+        auto rep = pdfsig::verifyPdfFile(argv[2], streebog256HashFn());
+        printVerifyReport(rep, nullptr);
+        return rep.valid() ? 0 : 1;
+    }
+    if (!arg.empty()) {
+        std::cout << "Использование: ./auth3fa [--selftest | --bench | --verify <файл.pdf>]\n";
+        return 2;
+    }
+
+    // Самотестирование криптографии при каждом запуске (как в
+    // сертифицированных криптомодулях): при расхождении с ГОСТ — стоп.
+    if (!startupSelfTest()) return 3;
     // Автоматический flush после каждого вывода — иначе при перенаправлении
     // stdin/stdout (например, в тестах или через pipe) подсказки могут
     // "застрять" в буфере и программа будет выглядеть зависшей.
