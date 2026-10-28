@@ -6,6 +6,11 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 LDLIBS   := -lcurl -lgmp -pthread
 
+# На некоторых старых версиях GCC std::filesystem требует отдельной библиотеки.
+ifeq ($(shell uname -s),Linux)
+  LDLIBS += -lstdc++fs
+endif
+
 # Homebrew ставит GMP в /opt/homebrew (Apple Silicon) или /usr/local (Intel) —
 # находим префикс автоматически.
 BREW_GMP := $(shell brew --prefix gmp 2>/dev/null)
