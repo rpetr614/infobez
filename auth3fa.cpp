@@ -69,6 +69,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -2723,6 +2724,94 @@ static std::string readMultilineMessage() {
     return msg;
 }
 
+// Читает текстовый файл целиком в бинарном режиме, сохраняя все байты
+// (включая переводы строк) без преобразования. Ограничение защищает от
+// случайной загрузки чрезмерно большого файла в память.
+static bool readTextFile(const std::string& fileName, std::string& text,
+                         std::string& error) {
+    namespace fs = std::filesystem;
+    constexpr uintmax_t MAX_TEXT_FILE_SIZE = 64ull * 1024ull * 1024ull;
+    try {
+        fs::path path(fileName);
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != ".txt") {
+            error = "ожидается файл с расширением .txt";
+            return false;
+        }
+        if (!fs::exists(path) || !fs::is_regular_file(path)) {
+            error = "файл не найден или не является обычным файлом";
+            return false;
+        }
+        const uintmax_t size = fs::file_size(path);
+        if (size > MAX_TEXT_FILE_SIZE) {
+            error = "файл превышает лимит 64 МиБ";
+            return false;
+        }
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            error = "не удалось открыть файл для чтения";
+            return false;
+        }
+        text.assign(std::istreambuf_iterator<char>(in),
+                    std::istreambuf_iterator<char>());
+        if (in.bad()) {
+            text.clear();
+            error = "ошибка при чтении файла";
+            return false;
+        }
+        if (text.size() != size) {
+            text.clear();
+            error = "размер файла изменился во время чтения";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("ошибка доступа к файлу: ") + e.what();
+        return false;
+    }
+}
+
+static bool readMessageInput(std::string& msg) {
+    std::cout << "\nОткуда взять текст для шифрования?\n"
+              << "1. Ввести в консоль\n"
+              << "2. Прочитать из .txt файла\n"
+              << "Выбор: ";
+    std::string source;
+    std::getline(std::cin, source);
+    if (source == "1") {
+        msg = readMultilineMessage();
+        return true;
+    }
+    if (source != "2") {
+        std::cout << "Некорректный выбор.\n";
+        return false;
+    }
+
+    std::cout << "Путь к .txt файлу (можно указать в кавычках): ";
+    std::string path;
+    std::getline(std::cin, path);
+    if (path.size() >= 2 &&
+        ((path.front() == '"' && path.back() == '"') ||
+         (path.front() == '\'' && path.back() == '\''))) {
+        path = path.substr(1, path.size() - 2);
+    }
+    if (path.empty()) {
+        std::cout << "Путь не указан.\n";
+        return false;
+    }
+
+    std::string error;
+    if (!readTextFile(path, msg, error)) {
+        std::cout << "Не удалось прочитать файл: " << error << ".\n";
+        return false;
+    }
+    std::cout << "Прочитано из файла " << path << ": " << msg.size()
+              << " байт.\n";
+    return true;
+}
+
 static void encryptNewMessage(UserSession& s) {
     std::cout << "\nВыберите алгоритм шифрования:\n"
               << "1. Кузнечик (ГОСТ Р 34.12-2015), 256-битный ключ\n"
@@ -2735,10 +2824,29 @@ static void encryptNewMessage(UserSession& s) {
     else if (choice == "2") algo = "RSA";
     else { std::cout << "Некорректный выбор.\n"; return; }
 
-    if (algo == "RSA" && !ensureRsaKey(s)) return;
-
-    std::string msg = readMultilineMessage();
+    std::string msg;
+    if (!readMessageInput(msg)) return;
     if (msg.empty()) { std::cout << "Пустое сообщение — отменено.\n"; return; }
+
+    // RSA-32768 напрямую обрабатывает каждый блок сообщения; большие файлы
+    // могут шифроваться/расшифровываться несколько минут. Даем пользователю
+    // возможность отменить операцию до генерации/загрузки ключа.
+    if (algo == "RSA" && msg.size() >= 1024ull * 1024ull) {
+        std::cout << "ВНИМАНИЕ: RSA-32768 шифрует файл блоками и для больших файлов "
+                  << "может работать несколько минут. Продолжить? (д/н): ";
+        std::string confirm;
+        std::getline(std::cin, confirm);
+        if (confirm != "д" && confirm != "Д" && confirm != "y" && confirm != "Y" &&
+            confirm != "да" && confirm != "Да") {
+            secureWipe(msg);
+            std::cout << "Операция отменена.\n";
+            return;
+        }
+    }
+    if (algo == "RSA" && !ensureRsaKey(s)) {
+        secureWipe(msg);
+        return;
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     StoredMessage m;
