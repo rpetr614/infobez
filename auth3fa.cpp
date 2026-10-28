@@ -1537,13 +1537,16 @@ static void registerUser() {
               << "  " << otpauthUri << "\n\n";
 }
 
+// Административное формирование PDF по выбранному пользователю.
+static bool generateAdminPdfReport(const std::string& username, const std::string& adminPassword, std::string& err);
+
 // ============================================================
 // Панель администратора
 // ============================================================
 // Доступна только под служебной учётной записью Admin (см. ADMIN_USERNAME
 // / ADMIN_PASSWORD выше). Проверяется только пароль — без TOTP и без
 // почты, т.к. это единая служебная запись, а не аккаунт с почтой.
-static void runAdminPanel() {
+static void runAdminPanel(const std::string& adminPassword) {
     while (true) {
         auto users = loadUsers();
 
@@ -1551,7 +1554,8 @@ static void runAdminPanel() {
                   << "1. Показать все учётные записи\n"
                   << "2. Добавить новую учётную запись (только логин+пароль)\n"
                   << "3. Удалить учётную запись\n"
-                  << "4. Выйти из панели администратора\n"
+                  << "4. Сформировать PDF-отчёт по пользователю\n"
+                  << "5. Выйти из панели администратора\n"
                   << "Выберите пункт: ";
         std::string choice;
         std::getline(std::cin, choice);
@@ -1618,6 +1622,29 @@ static void runAdminPanel() {
             deleteVault(delUsername);   // вместе с учёткой удаляем её ключи и сообщения
             std::cout << "Учётная запись \"" << delUsername << "\" удалена.\n";
         } else if (choice == "4") {
+            if (users.empty()) {
+                std::cout << "Нет пользовательских учётных записей.\n";
+                continue;
+            }
+            std::vector<std::vector<std::string>> rows;
+            rows.reserve(users.size());
+            for (const auto& u : users) rows.push_back({u.username});
+            std::cout << "\nПользователи, для которых доступно формирование отчёта:\n";
+            printAlignedTable({"Логин"}, rows);
+            std::cout << "Логин пользователя: ";
+            std::string target;
+            std::getline(std::cin, target);
+            auto it = std::find_if(users.begin(), users.end(), [&](const UserRecord& u) {
+                return u.username == target;
+            });
+            if (it == users.end()) {
+                std::cout << "Пользователь не найден.\n";
+                continue;
+            }
+            std::string err;
+            if (!generateAdminPdfReport(target, adminPassword, err))
+                std::cout << "Не удалось сформировать PDF: " << err << "\n";
+        } else if (choice == "5") {
             std::cout << "Выход из панели администратора.\n";
             return;
         } else {
@@ -2416,6 +2443,7 @@ struct UserSession {
     rsa::PrivateKey rsaKey;
     gost3410::KeyPair sigKey;      // ключ ЭЦП ГОСТ Р 34.10-2012
     asn1::Bytes sigCert;           // самоподписанный сертификат X.509 с этим ключом
+    UserSession* externalSigner = nullptr; // для админского отчёта подписывает Admin, а не владелец данных
     ~UserSession() { secureWipe(kek); secureWipe(msgKey); sigKey.d.wipe(); }
 };
 
@@ -2535,6 +2563,40 @@ static void printVerifyReport(const pdfsig::VerifyReport& r, const UserSession* 
                                              : "ПОДПИСЬ НЕДЕЙСТВИТЕЛЬНА — документ изменён или подпись повреждена.") << "\n";
 }
 
+// Создаёт административную обёртку ключа хранилища после успешного входа
+// владельца. Без такой обёртки существующий KEK криптографически невозможно
+// восстановить только по административному паролю.
+static bool ensureAdminEscrow(UserSession& s, std::string& err) {
+    const bool hasSalt = s.keys.count("admin_kdf_salt") != 0;
+    const bool hasIter = s.keys.count("admin_kdf_iter") != 0;
+    const bool hasWrap = s.keys.count("admin_kek_wrap") != 0;
+    if (hasSalt && hasIter && hasWrap) return true;
+    if (hasSalt || hasIter || hasWrap) {
+        err = "поля административного резервного доступа повреждены; автоматическая перезапись запрещена";
+        return false;
+    }
+    if (s.kek.size() != 64) {
+        err = "неверный размер ключа хранилища для административного резервирования";
+        return false;
+    }
+    auto salt = securerand::bytes(16);
+    auto adminKek = pbkdf2Streebog512(ADMIN_PASSWORD, salt, PBKDF2_ITERATIONS, 64);
+    std::string rawKek(s.kek.begin(), s.kek.end());
+    s.keys["admin_kdf_salt"] = toHex(salt);
+    s.keys["admin_kdf_iter"] = std::to_string(PBKDF2_ITERATIONS);
+    s.keys["admin_kek_wrap"] = sealedToString(kuzSeal(adminKek, rawKek));
+    secureWipe(rawKek);
+    secureWipe(adminKek);
+    if (!saveKeyValueFile(vaultKeysFile(s.username), s.keys)) {
+        err = "не удалось сохранить административную обёртку ключа в " + vaultKeysFile(s.username);
+        s.keys.erase("admin_kdf_salt");
+        s.keys.erase("admin_kdf_iter");
+        s.keys.erase("admin_kek_wrap");
+        return false;
+    }
+    return true;
+}
+
 // Открывает (или при первом использовании создаёт) хранилище пользователя
 static bool unlockVault(const std::string& username, const std::string& password,
                         UserSession& s, std::string& err) {
@@ -2558,6 +2620,7 @@ static bool unlockVault(const std::string& username, const std::string& password
         s.keys["created"] = std::to_string(nowUnixTime());
         secureWipe(mk);
         if (!saveKeyValueFile(keysPath, s.keys)) { err = "не удалось записать " + keysPath; return false; }
+        if (!ensureAdminEscrow(s, err)) return false;
         return true;
     }
 
@@ -2578,6 +2641,7 @@ static bool unlockVault(const std::string& username, const std::string& password
     }
     s.msgKey.assign(mk.begin(), mk.end());
     secureWipe(mk);
+    if (!ensureAdminEscrow(s, err)) return false;
     return true;
 }
 
@@ -2961,16 +3025,17 @@ static std::vector<std::string> gostSummaryTable() {
                       {Align::Left, Align::Left, Align::Right, Align::Left});
 }
 
-static void generatePdfReport(UserSession& s) {
+static bool generatePdfReport(UserSession& s) {
+    UserSession& signer = s.externalSigner ? *s.externalSigner : s;
     auto msgs = loadMessages(s.username);
-    if (msgs.empty()) { std::cout << "У вас пока нет зашифрованных сообщений — отчёт пуст.\n"; return; }
+    if (msgs.empty()) { std::cout << "У пользователя пока нет зашифрованных сообщений — отчёт не сформирован.\n"; return false; }
 
     pdf::Document doc;
     std::string err, fontPath = findFontPath(false), monoPath = findFontPath(true);
     if (fontPath.empty() || doc.addFont(fontPath, err) < 0) {
         std::cout << "Не найден TrueType-шрифт с кириллицей" << (err.empty() ? "" : " (" + err + ")")
                   << ". Укажите путь к .ttf в переменной окружения PDF_FONT или положите font.ttf рядом с программой.\n";
-        return;
+        return false;
     }
     int mono = 0;
     if (!monoPath.empty()) { int f = doc.addFont(monoPath, err); if (f >= 0) mono = f; }
@@ -2992,6 +3057,9 @@ static void generatePdfReport(UserSession& s) {
     doc.paragraph("Отчёт о зашифрованных сообщениях", 20, 0, pdf::ACCENT);
     doc.space(4);
     doc.paragraph("Пользователь: " + s.username, 11);
+    if (s.externalSigner)
+        doc.paragraph("Отчёт сформирован администратором. Электронная подпись принадлежит учётной записи Admin.",
+                      9, 0, pdf::GRAY, 8);
     doc.paragraph("Дата формирования: " + formatTime(now), 11);
     doc.paragraph("Сообщений: " + std::to_string(reps.size()) + ", успешно расшифровано и проверено: " +
                   std::to_string(okCount), 11);
@@ -3101,8 +3169,8 @@ static void generatePdfReport(UserSession& s) {
             {"Алгоритм подписи", "ГОСТ Р 34.10-2012, 256 бит"},
             {"Хеш-функция", "ГОСТ Р 34.11-2012 (Стрибог-256)"},
             {"Кривая", curve.name},
-            {"Подписант", s.username},
-            {"Отпечаток сертификата", certFingerprint(s.sigCert)},
+            {"Подписант", signer.username},
+            {"Отпечаток сертификата", certFingerprint(signer.sigCert)},
             {"Время подписи", formatTime(now)},
             {"Формат", "CMS (PKCS#7 detached) внутри PDF"},
         };
@@ -3112,10 +3180,10 @@ static void generatePdfReport(UserSession& s) {
                   "подписания делает подпись недействительной. Проверка: пункт меню \"Проверить подпись PDF\" или "
                   "команда ./auth3fa --verify <файл.pdf>.", 8.5, 0, pdf::GRAY);
     doc.paragraph("Открытый ключ проверки подписи (x || y, little-endian, hex):", 8.5, 0, pdf::BLACK);
-    doc.paragraph(s.keys["sig_pub"], 7, mono, pdf::GRAY, 8, 1.25);
+    doc.paragraph(signer.keys["sig_pub"], 7, mono, pdf::GRAY, 8, 1.25);
 
     pdf::Document::SignatureRequest req;
-    req.name = s.username;
+    req.name = signer.username;
     req.reason = "Отчёт о зашифрованных сообщениях";
     req.location = "infobez auth3fa";
     req.contact = "ГОСТ Р 34.10-2012 / ГОСТ Р 34.11-2012";
@@ -3124,22 +3192,94 @@ static void generatePdfReport(UserSession& s) {
     req.signer = [&](const std::string& signedPart) {
         auto t0 = BenchClock::now();
         auto digest = streebog256Bytes(reinterpret_cast<const uint8_t*>(signedPart.data()), signedPart.size());
-        auto cms = pdfsig::buildCms(curve, s.sigKey, s.sigCert, digest, static_cast<time_t>(now),
+        auto cms = pdfsig::buildCms(curve, signer.sigKey, signer.sigCert, digest, static_cast<time_t>(now),
                                     streebog256HashFn(), cspRandomFn());
         signSec = secondsSince(t0);
         return cms;
     };
     doc.setSignature(req);
 
-    if (!doc.save(fileName, err)) { std::cout << "Ошибка: " << err << "\n"; return; }
+    if (!doc.save(fileName, err)) { std::cout << "Ошибка: " << err << "\n"; return false; }
     std::error_code ec;
     auto abs = std::filesystem::absolute(fileName, ec);
     std::cout << "PDF-отчёт сохранён: " << (ec ? fileName : abs.string()) << "\n"
               << "Сообщений: " << reps.size() << ", успешно расшифровано: " << okCount << ".\n"
               << "Документ подписан ЭЦП ГОСТ Р 34.10-2012 за " << fmtTime(signSec) << " (подписано "
               << doc.signedBytes() << " байт). Контрольная проверка подписи:\n";
-    printVerifyReport(pdfsig::verifyPdfFile(fileName, streebog256HashFn()), &s);
+    printVerifyReport(pdfsig::verifyPdfFile(fileName, streebog256HashFn()), &signer);
     if (emojiTotal) std::cout << "Из текста сообщений в PDF удалено эмодзи: " << emojiTotal << ".\n";
+    return true;
+}
+
+// Открывает пользовательское хранилище через административную обёртку KEK,
+// затем формирует тот же отчёт, но подписывает его отдельным ключом Admin.
+static bool generateAdminPdfReport(const std::string& username, const std::string& adminPassword, std::string& err) {
+    if (username.empty() || username == ADMIN_USERNAME) {
+        err = "недопустимое имя пользователя";
+        return false;
+    }
+    if (!vaultExists(username)) {
+        err = "у пользователя ещё нет хранилища (он должен войти в систему хотя бы один раз)";
+        return false;
+    }
+
+    UserSession target;
+    target.username = username;
+    target.keys = loadKeyValueFile(vaultKeysFile(username));
+    if (!target.keys.count("admin_kdf_salt") || !target.keys.count("admin_kdf_iter") ||
+        !target.keys.count("admin_kek_wrap")) {
+        err = "для этого существующего хранилища ещё не создан административный резервный доступ; "
+              "пользователь должен один раз успешно войти после обновления программы";
+        return false;
+    }
+
+    std::vector<uint8_t> salt;
+    uint32_t iterations = 0;
+    SealedData wrapped;
+    try { iterations = static_cast<uint32_t>(std::stoul(target.keys["admin_kdf_iter"])); } catch (...) {}
+    if (!hexDecode(target.keys["admin_kdf_salt"], salt) || salt.size() < 16 || iterations == 0 ||
+        !sealedFromString(target.keys["admin_kek_wrap"], wrapped)) {
+        err = "параметры административного резервного доступа повреждены";
+        return false;
+    }
+    auto adminKek = pbkdf2Streebog512(adminPassword, salt, iterations, 64);
+    std::string rawKek;
+    bool opened = kuzOpen(adminKek, wrapped, rawKek) && rawKek.size() == 64;
+    secureWipe(adminKek);
+    if (!opened) {
+        secureWipe(rawKek);
+        err = "не удалось открыть административную обёртку ключа; проверь пароль администратора и целостность хранилища";
+        return false;
+    }
+    target.kek.assign(rawKek.begin(), rawKek.end());
+    secureWipe(rawKek);
+
+    SealedData wrappedMsgKey;
+    std::string rawMsgKey;
+    if (!target.keys.count("msg_key") || !sealedFromString(target.keys["msg_key"], wrappedMsgKey) ||
+        !kuzOpen(target.kek, wrappedMsgKey, rawMsgKey) || rawMsgKey.size() != 64) {
+        secureWipe(rawMsgKey);
+        err = "не удалось открыть ключ сообщений пользователя: хранилище повреждено или изменено";
+        return false;
+    }
+    target.msgKey.assign(rawMsgKey.begin(), rawMsgKey.end());
+    secureWipe(rawMsgKey);
+
+    if (!ensureSigningKey(target, err)) return false;
+
+    // Для сохранения смысла электронной подписи отчёт администратора
+    // подписывается ключом Admin, а не закрытым ключом пользователя.
+    UserSession adminSigner;
+    if (!unlockVault(ADMIN_USERNAME, adminPassword, adminSigner, err)) return false;
+    if (!ensureSigningKey(adminSigner, err)) return false;
+    target.externalSigner = &adminSigner;
+    bool generated = generatePdfReport(target);
+    target.externalSigner = nullptr;
+    if (!generated) {
+        err = "формирование PDF не завершено; проверьте сообщения пользователя, шрифты и права на запись";
+        return false;
+    }
+    return true;
 }
 
 static void showKeyInfo(UserSession& s) {
@@ -3220,11 +3360,13 @@ static void loginUser(const SmtpConfig& smtpConfig) {
     if (username == ADMIN_USERNAME) {
         std::string adminPassword = readHiddenInput("Пароль администратора: ");
         if (adminPassword != ADMIN_PASSWORD) {
+            secureWipe(adminPassword);
             std::cout << "Неверный логин или пароль.\n";
             return;
         }
         std::cout << "\nВход выполнен: администратор.\n";
-        runAdminPanel();
+        runAdminPanel(adminPassword);
+        secureWipe(adminPassword);
         return;
     }
 
